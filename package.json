@@ -1,0 +1,85 @@
+{
+  "name": "@easypayment/medusa-payment-paypal",
+  "version": "0.8.6",
+  "description": "PayPal integration for Medusa v2",
+  "author": "EasyPayment Plugins",
+  "license": "MIT",
+  "main": "./.medusa/server/src/index.js",
+  "types": "./.medusa/server/src/index.d.ts",
+  "files": [
+    ".medusa/server",
+    "src",
+    "scripts",
+    "package.json",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
+  "exports": {
+    "./package.json": "./package.json",
+    "./admin": "./.medusa/server/src/admin/index.mjs",
+    "./workflows": "./.medusa/server/src/workflows/index.js",
+    "./providers/paypal": "./.medusa/server/src/providers/paypal/index.js",
+    "./providers/paypal_card": "./.medusa/server/src/providers/paypal_card/index.js",
+    "./modules/paypal": "./.medusa/server/src/modules/paypal/index.js",
+    ".": "./.medusa/server/src/index.js",
+    "./.medusa/server/src/modules/*": "./.medusa/server/src/modules/*/index.js",
+    "./.medusa/server/src/modules/paypal": "./.medusa/server/src/modules/paypal/index.js",
+    "./.medusa/server/src/providers/*": "./.medusa/server/src/providers/*/index.js",
+    "./.medusa/server/src/providers/paypal": "./.medusa/server/src/providers/paypal/index.js",
+    "./.medusa/server/src/providers/paypal_card": "./.medusa/server/src/providers/paypal_card/index.js",
+    "./.medusa/server/src/admin": "./.medusa/server/src/admin/index.mjs",
+    "./.medusa/server/src/workflows": "./.medusa/server/src/workflows/index.js",
+    "./.medusa/server/src/*": "./.medusa/server/src/*.js",
+    "./.medusa/*": "./.medusa/*"
+  },
+  "scripts": {
+    "build": "medusa plugin:build",
+    "develop": "medusa plugin:develop",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@medusajs/admin-sdk": "2.12.5",
+    "@medusajs/cli": "2.12.5",
+    "@medusajs/framework": "2.12.5",
+    "@medusajs/medusa": "2.12.5",
+    "@medusajs/test-utils": "2.12.5",
+    "@medusajs/ui": "^4.0.0",
+    "@medusajs/icons": "2.12.5",
+    "@swc/core": "^1.5.7",
+    "typescript": "^5.6.2"
+  },
+  "peerDependencies": {
+    "@medusajs/admin-sdk": "^2.12.0",
+    "@medusajs/framework": "^2.12.0",
+    "@medusajs/medusa": "^2.12.0",
+    "@medusajs/ui": "^4.0.0",
+    "@medusajs/icons": "^2.12.0"
+  },
+  "peerDependenciesMeta": {
+    "@medusajs/admin-sdk": { "optional": true },
+    "@medusajs/ui": { "optional": true },
+    "@medusajs/icons": { "optional": true }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/easypaymentplugins/medusa-paypal.git"
+  },
+  "keywords": [
+    "medusa",
+    "medusa-v2",
+    "medusa-plugin",
+    "medusa-plugin-integration",
+    "medusa-plugin-payment",
+    "medusa-paypal-payment",
+    "medusa-paypal-plugin",
+    "medusa-paypal-integration",
+    "medusa-paypal"
+  ]
+}
