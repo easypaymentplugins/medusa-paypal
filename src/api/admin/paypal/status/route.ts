@@ -2,11 +2,16 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import type PayPalModuleService from "../../../../modules/paypal/service"
 
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
-  const paypal = req.scope.resolve<PayPalModuleService>("paypal_onboarding")
+  try {
+    const paypal = req.scope.resolve<PayPalModuleService>("paypal_onboarding")
 
-  const q = (req.query || {}) as Record<string, any>
-  const envParam = (q.environment || q.env) as string | undefined
-  const env = envParam === "live" ? "live" : envParam === "sandbox" ? "sandbox" : undefined
+    const q = (req.query || {}) as Record<string, any>
+    const envParam = (q.environment || q.env) as string | undefined
+    const env = envParam === "live" ? "live" : envParam === "sandbox" ? "sandbox" : undefined
 
-  return res.json(await paypal.getStatus(env))
+    return res.json(await paypal.getStatus(env))
+  } catch (e: unknown) {
+    console.error("[PayPal] status GET failed:", e instanceof Error ? e.message : e)
+    return res.status(500).json({ message: "Failed to retrieve PayPal status" })
+  }
 }

@@ -1,6 +1,6 @@
 import type { MedusaContainer } from "@medusajs/framework/types"
 import { Modules } from "@medusajs/framework/utils"
-import { isPayPalProviderId } from "./utils/provider-ids"
+import { isPayPalProviderId, PAYPAL_PROVIDER_IDS } from "./utils/provider-ids"
 
 
 export const EVENT_STATUS_MAP: Record<
@@ -143,7 +143,10 @@ export function extractIdentifiers(
     refundId = String(resource?.id || "").trim() || null
     orderId = String(related?.order_id || "").trim() || null
     captureId = String(related?.capture_id || "").trim() || null
-    cartId = null
+    // The refund resource carries the capture's custom_id (the cart id) when it
+    // was set on the purchase unit — use it so refunds resolve directly instead
+    // of always falling back to a session scan.
+    cartId = String(resource?.custom_id || "").trim() || null
   }
 
   return { orderId, captureId, refundId, cartId }
@@ -294,18 +297,35 @@ export async function processPayPalWebhookEvent(
 
   let cartId = rawCartId
 
-  if (!cartId) {
+  if (!cartId && (orderId || captureId)) {
     try {
       const paymentModule = container.resolve(Modules.PAYMENT) as any
-      const allSessions = await paymentModule.listPaymentSessions({
-        provider_id: ["pp_paypal_paypal", "pp_paypal_card_paypal_card"],
-      })
-      const matchedSession = (allSessions || []).find((s: any) => {
-        const pp = ((s.data || {}) as Record<string, any>).paypal || {}
-        if (orderId && pp.order_id === orderId) return true
-        if (captureId && pp.capture_id === captureId) return true
-        return false
-      })
+      // Fallback when the webhook resource carries no custom_id: locate the
+      // PayPal session whose stored data matches this order_id / capture_id.
+      // Paginate to exhaustion rather than scanning a single fixed page — on a
+      // busy store the matching session is frequently beyond the first page, so
+      // a hard cap would silently drop capture/refund status updates.
+      const PAGE_SIZE = 200
+      const MAX_PAGES = 100 // safety bound (20k sessions) against a misbehaving driver
+      let matchedSession: Record<string, unknown> | null = null
+
+      for (let page = 0; page < MAX_PAGES && !matchedSession; page++) {
+        const sessions = await paymentModule.listPaymentSessions(
+          { provider_id: [...PAYPAL_PROVIDER_IDS] },
+          { take: PAGE_SIZE, skip: page * PAGE_SIZE }
+        )
+        if (!sessions || sessions.length === 0) break
+        matchedSession =
+          sessions.find((s: Record<string, unknown>) => {
+            const pp =
+              (((s.data || {}) as Record<string, unknown>).paypal as Record<string, unknown>) || {}
+            if (orderId && pp.order_id === orderId) return true
+            if (captureId && pp.capture_id === captureId) return true
+            return false
+          }) || null
+        if (sessions.length < PAGE_SIZE) break
+      }
+
       if (matchedSession?.payment_collection_id) {
         const colls = await paymentModule.listPaymentCollections(
           { id: [matchedSession.payment_collection_id] },

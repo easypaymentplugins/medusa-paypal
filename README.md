@@ -131,6 +131,10 @@ npx medusa db:migrate
 
 Credentials are saved automatically. Prefer manual setup? Click **Insert credentials manually** and paste your Client ID and Secret from [developer.paypal.com](https://developer.paypal.com/dashboard/).
 
+> **🔐 Encrypt secrets at rest (recommended for production).** Set `PAYPAL_ENCRYPTION_KEY` to any strong random string. The seller client secret and PayPal app access token are then stored AES‑256‑GCM‑encrypted in the database; without it they are stored in plaintext (the previous default). Encryption is transparent — existing plaintext credentials keep working and are upgraded to ciphertext the next time they are saved/refreshed.
+>
+> Keep this key safe and backed up: **if it is lost, stored credentials cannot be decrypted** and you must reconnect PayPal. Rotating the key requires re‑saving credentials.
+
 ---
 
 ### Step 4 — Enable providers in your region
@@ -164,6 +168,14 @@ The checkout UI is shipped as a separate package — **install it inside your st
 📦 **[@easypayment/medusa-paypal-ui](https://www.npmjs.com/package/@easypayment/medusa-paypal-ui)** — React components, hooks, and a drop-in payment step adapter for Next.js App Router storefronts.
 
 See the [storefront integration & testing guide →](https://www.npmjs.com/package/@easypayment/medusa-paypal-ui)
+
+---
+
+## 📊 Observability
+
+- **Metrics** — operational counters (e.g. `create_order_success`, `capture_order_failed`, `webhook_success`, `webhook_dead_letter`) are persisted in the `paypal_metric` table.
+- **Audit trail** — security/lifecycle events (credential changes, environment switches, webhook registration, capture/refund failures, alerts) are emitted as structured JSON log lines tagged `"log":"paypal_audit"`. In production, ship stdout to your log aggregator and filter on that tag. Sensitive fields (secrets, tokens) are redacted before logging.
+- **Webhooks** — every received event is recorded in `paypal_webhook_event` with status (`processed` / `failed` / `dead_letter` / `ignored`), attempt count, and last error; failures are retried by the `paypal-webhook-retry` job.
 
 ---
 

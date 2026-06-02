@@ -1,4 +1,6 @@
 import { MedusaService } from "@medusajs/framework/utils"
+import { paypalFetch } from "./utils/paypal-fetch"
+import { decryptSecret, encryptSecret } from "./utils/secret-crypto"
 import PayPalConnection from "./models/paypal_connection"
 import PayPalMetric from "./models/paypal_metric"
 import PayPalSettings from "./models/paypal_settings"
@@ -15,6 +17,28 @@ type Status =
   | "connected"
   | "revoked"
 
+const SENSITIVE_KEY_RE =
+  /secret|password|client_secret|access_token|refresh_token|authorization|auth_code|api[_-]?key/i
+
+/**
+ * Defensive redaction for audit logs: replace values of keys that look
+ * sensitive with "[REDACTED]". Bounded depth/breadth so a pathological payload
+ * can't blow up logging.
+ */
+function redactSensitive(value: unknown, depth = 0): unknown {
+  if (depth > 6 || value === null || typeof value !== "object") {
+    return value
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 50).map((v) => redactSensitive(v, depth + 1))
+  }
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = SENSITIVE_KEY_RE.test(k) ? "[REDACTED]" : redactSensitive(v, depth + 1)
+  }
+  return out
+}
+
 class PayPalModuleService extends MedusaService({
   PayPalConnection,
   PayPalMetric,
@@ -22,6 +46,7 @@ class PayPalModuleService extends MedusaService({
   PayPalWebhookEvent,
 }) {
   protected cfg = getPayPalConfig()
+  private tokenRefreshPromise: Promise<string> | null = null
 
   private get bnCode(): string {
     return this.cfg.bnCode || "MBJTechnolabs_SI_SPB"
@@ -130,7 +155,10 @@ class PayPalModuleService extends MedusaService({
     const creds = meta?.credentials?.[env] || {}
     return {
       clientId: creds.client_id || creds.clientId || undefined,
-      clientSecret: creds.client_secret || creds.clientSecret || undefined,
+      // Secrets are encrypted at rest when PAYPAL_ENCRYPTION_KEY is set; decrypt
+      // here so every consumer (auth, status) sees plaintext. Legacy plaintext
+      // values pass through unchanged.
+      clientSecret: decryptSecret(creds.client_secret || creds.clientSecret) || undefined,
       sellerMerchantId:
         creds.seller_merchant_id ||
         creds.sellerMerchantId ||
@@ -142,10 +170,14 @@ class PayPalModuleService extends MedusaService({
     }
   }
 
-  private extractSellerEmail(...candidates: any[]): string | null {
+  private extractSellerEmail(...candidates: unknown[]): string | null {
     const queue = [...candidates]
+    const seen = new WeakSet<object>()
+    const MAX_ITERATIONS = 500
 
-    while (queue.length > 0) {
+    let iterations = 0
+    while (queue.length > 0 && iterations < MAX_ITERATIONS) {
+      iterations++
       const value = queue.shift()
       if (!value) {
         continue
@@ -159,34 +191,41 @@ class PayPalModuleService extends MedusaService({
         continue
       }
 
+      if (typeof value !== "object") {
+        continue
+      }
+
+      if (seen.has(value as object)) {
+        continue
+      }
+      seen.add(value as object)
+
       if (Array.isArray(value)) {
         queue.push(...value)
         continue
       }
 
-      if (typeof value === "object") {
-        const obj = value as Record<string, any>
-        const prioritized = [
-          obj.email,
-          obj.primary_email,
-          obj.merchant_email,
-          obj.email_address,
-          obj.account_email,
-          obj.contact_email,
-          obj.value,
-          obj.address,
-        ]
-        queue.push(...prioritized)
+      const obj = value as Record<string, unknown>
+      const prioritized = [
+        obj.email,
+        obj.primary_email,
+        obj.merchant_email,
+        obj.email_address,
+        obj.account_email,
+        obj.contact_email,
+        obj.value,
+        obj.address,
+      ]
+      queue.push(...prioritized)
 
-        for (const [k, v] of Object.entries(obj)) {
-          const key = String(k).toLowerCase()
-          if (key.includes("email") || key.includes("address")) {
-            queue.push(v)
-          }
+      for (const [k, v] of Object.entries(obj)) {
+        const key = String(k).toLowerCase()
+        if (key.includes("email") || key.includes("address")) {
+          queue.push(v)
         }
-
-        queue.push(...Object.values(obj))
       }
+
+      queue.push(...Object.values(obj))
     }
 
     return null
@@ -205,7 +244,7 @@ class PayPalModuleService extends MedusaService({
     const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
     const accessToken = accessTokenOverride ?? await this.getAppAccessToken()
 
-    const resp = await fetch(
+    const resp = await paypalFetch(
       `${baseUrl}/v1/customer/partners/${encodeURIComponent(
         partnerMerchantId
       )}/merchant-integrations/${encodeURIComponent(merchantId)}`,
@@ -246,7 +285,7 @@ class PayPalModuleService extends MedusaService({
     const body = new URLSearchParams()
     body.set("grant_type", "client_credentials")
 
-    const res = await fetch(`${baseUrl}/v1/oauth2/token`, {
+    const res = await paypalFetch(`${baseUrl}/v1/oauth2/token`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -302,7 +341,7 @@ class PayPalModuleService extends MedusaService({
     ).trim() || null
 
     try {
-      const userInfoResp = await fetch(`${baseUrl}/v1/identity/oauth2/userinfo?schema=paypalv1`, {
+      const userInfoResp = await paypalFetch(`${baseUrl}/v1/identity/oauth2/userinfo?schema=paypalv1`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -325,7 +364,7 @@ class PayPalModuleService extends MedusaService({
 
     if (partnerMerchantId) {
       try {
-        const credsResp = await fetch(
+        const credsResp = await paypalFetch(
           `${baseUrl}/v1/customer/partners/${encodeURIComponent(
             partnerMerchantId
           )}/merchant-integrations/credentials/`,
@@ -394,7 +433,8 @@ class PayPalModuleService extends MedusaService({
       id: row.id,
       status: c.clientId && c.clientSecret ? "connected" : "disconnected",
       seller_client_id: c.clientId || null,
-      seller_client_secret: c.clientSecret || null,
+      // c.clientSecret is decrypted (from getEnvCreds); re-encrypt for the column.
+      seller_client_secret: encryptSecret(c.clientSecret) || null,
       seller_merchant_id: c.sellerMerchantId || null,
       seller_email: c.sellerEmail || null,
       metadata: {
@@ -477,12 +517,11 @@ class PayPalModuleService extends MedusaService({
 
     const products = input?.products?.length ? input.products : ["PPCP"]
 
-    products.forEach((p, i) => {
-      form.append(`products[${i}]`, p)
+    products.forEach((p) => {
       form.append("products[]", p)
     })
 
-    const res = await fetch(onboarding.partner_service_url, {
+    const res = await paypalFetch(onboarding.partner_service_url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: form.toString(),
@@ -623,7 +662,7 @@ class PayPalModuleService extends MedusaService({
 
     const basic = Buffer.from(`${input.sharedId}:`).toString("base64")
 
-    const tokenRes = await fetch(`${baseUrl}/v1/oauth2/token`, {
+    const tokenRes = await paypalFetch(`${baseUrl}/v1/oauth2/token`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -657,7 +696,7 @@ class PayPalModuleService extends MedusaService({
       throw new Error("Missing PayPal partner merchant id configuration.")
     }
 
-    const credRes = await fetch(
+    const credRes = await paypalFetch(
       `${baseUrl}/v1/customer/partners/${encodeURIComponent(partnerMerchantId)}/merchant-integrations/credentials/`,
       {
         method: "GET",
@@ -756,18 +795,16 @@ class PayPalModuleService extends MedusaService({
     const nextSellerEmail =
       (input.sellerEmail || "").trim() || existingCreds.sellerEmail || row?.seller_email || null
 
+    // Encrypt once and store the same ciphertext in both the metadata copy and
+    // the denormalized column (no-op when encryption is disabled).
+    const storedClientSecret = encryptSecret(input.clientSecret)
+
     const nextCreds = {
       client_id: input.clientId,
-      clientId: input.clientId,
-      client_secret: input.clientSecret,
-      clientSecret: input.clientSecret,
-      merchantId: nextSellerMerchantId,
+      client_secret: storedClientSecret,
       merchant_id: nextSellerMerchantId,
-      payer_id: nextSellerMerchantId,
       seller_merchant_id: nextSellerMerchantId,
-      sellerMerchantId: nextSellerMerchantId,
       seller_email: nextSellerEmail,
-      sellerEmail: nextSellerEmail,
     }
 
     if (!row) {
@@ -775,7 +812,7 @@ class PayPalModuleService extends MedusaService({
         environment: env,
         status: "connected",
         seller_client_id: input.clientId,
-        seller_client_secret: input.clientSecret,
+        seller_client_secret: storedClientSecret,
         seller_merchant_id: nextSellerMerchantId,
         seller_email: nextSellerEmail,
         app_access_token: null,
@@ -806,7 +843,7 @@ class PayPalModuleService extends MedusaService({
       id: row.id,
       status: "connected",
       seller_client_id: input.clientId,
-      seller_client_secret: input.clientSecret,
+      seller_client_secret: storedClientSecret,
       seller_merchant_id: nextSellerMerchantId,
       seller_email: nextSellerEmail,
       app_access_token: null,
@@ -904,7 +941,7 @@ class PayPalModuleService extends MedusaService({
       return webhookIds[env] || ""
     }
 
-    const listResp = await fetch(`${baseUrl}/v1/notifications/webhooks`, {
+    const listResp = await paypalFetch(`${baseUrl}/v1/notifications/webhooks`, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
@@ -924,7 +961,7 @@ class PayPalModuleService extends MedusaService({
     let webhookId = existing?.id ? String(existing.id) : ""
 
     if (!webhookId) {
-      const createResp = await fetch(`${baseUrl}/v1/notifications/webhooks`, {
+      const createResp = await paypalFetch(`${baseUrl}/v1/notifications/webhooks`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -1082,26 +1119,40 @@ class PayPalModuleService extends MedusaService({
 
   async getAppAccessToken(): Promise<string> {
     const row = await this.getCurrentRow()
-    const env = await this.getCurrentEnvironment()
-    const creds = await this.getActiveCredentials()
 
     if (!row) {
       throw new Error("PayPal connection row not found. Please complete onboarding.")
     }
 
-    const expiresAt = row.app_access_token_expires_at ? new Date(row.app_access_token_expires_at as any) : null
+    const expiresAt = row.app_access_token_expires_at ? new Date(row.app_access_token_expires_at as string) : null
     if (row.app_access_token && expiresAt) {
       const msLeft = expiresAt.getTime() - Date.now()
-      if (msLeft > 2 * 60 * 1000) return row.app_access_token
+      // Token is encrypted at rest when a key is configured; decrypt the cached
+      // value (legacy plaintext passes through unchanged).
+      if (msLeft > 2 * 60 * 1000) return decryptSecret(row.app_access_token as string) as string
     }
 
+    if (this.tokenRefreshPromise) {
+      return this.tokenRefreshPromise
+    }
+
+    this.tokenRefreshPromise = this.refreshAccessToken(row).finally(() => {
+      this.tokenRefreshPromise = null
+    })
+
+    return this.tokenRefreshPromise
+  }
+
+  private async refreshAccessToken(row: { id: string }): Promise<string> {
+    const env = await this.getCurrentEnvironment()
+    const creds = await this.getActiveCredentials()
     const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
     const basic = Buffer.from(`${creds.client_id}:${creds.client_secret}`).toString("base64")
 
     const body = new URLSearchParams()
     body.set("grant_type", "client_credentials")
 
-    const res = await fetch(`${baseUrl}/v1/oauth2/token`, {
+    const res = await paypalFetch(`${baseUrl}/v1/oauth2/token`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -1109,19 +1160,23 @@ class PayPalModuleService extends MedusaService({
         "PayPal-Partner-Attribution-Id": this.bnCode,
       },
       body,
+      signal: AbortSignal.timeout(30_000),
     })
 
     const json = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(`PayPal client_credentials failed (${res.status}): ${JSON.stringify(json)}`)
 
-    const accessToken = String(json.access_token)
+    const accessToken = String(json.access_token || "")
+    if (!accessToken) {
+      throw new Error("PayPal client_credentials succeeded but access_token is missing.")
+    }
     const expiresIn = Number(json.expires_in || 3600)
     const newExpiresAt = new Date(Date.now() + expiresIn * 1000)
 
     await this.updatePayPalConnections({
       id: row.id,
-      app_access_token: accessToken,
-      app_access_token_expires_at: newExpiresAt as any,
+      app_access_token: encryptSecret(accessToken),
+      app_access_token_expires_at: newExpiresAt as unknown as Date,
     })
 
     return accessToken
@@ -1133,7 +1188,7 @@ class PayPalModuleService extends MedusaService({
 
     const accessToken = await this.getAppAccessToken()
 
-    const res = await fetch(`${baseUrl}/v1/identity/generate-token`, {
+    const res = await paypalFetch(`${baseUrl}/v1/identity/generate-token`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -1232,39 +1287,26 @@ class PayPalModuleService extends MedusaService({
       throw new Error("PayPal orderId is required")
     }
 
-    const creds = await this.getActiveCredentials()
+    const env = await this.getCurrentEnvironment()
     const base =
-      creds.environment === "live"
+      env === "live"
         ? "https://api-m.paypal.com"
         : "https://api-m.sandbox.paypal.com"
-    const auth = Buffer.from(`${creds.client_id}:${creds.client_secret}`).toString("base64")
 
-    const tokenResp = await fetch(`${base}/v1/oauth2/token`, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${auth}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "PayPal-Partner-Attribution-Id": this.bnCode,
-      },
-      body: "grant_type=client_credentials",
-    })
+    const accessToken = await this.getAppAccessToken()
 
-    const tokenText = await tokenResp.text()
-    if (!tokenResp.ok) {
-      throw new Error(`PayPal token error (${tokenResp.status}): ${tokenText}`)
-    }
-
-    const tokenJson = JSON.parse(tokenText)
-    const accessToken = String(tokenJson.access_token)
-
-    const resp = await fetch(`${base}/v2/checkout/orders/${orderId}`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "PayPal-Partner-Attribution-Id": this.bnCode,
-      },
-    })
+    const resp = await paypalFetch(
+      `${base}/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "PayPal-Partner-Attribution-Id": this.bnCode,
+        },
+        signal: AbortSignal.timeout(30_000),
+      }
+    )
 
     const text = await resp.text()
     if (!resp.ok) {
@@ -1303,7 +1345,12 @@ class PayPalModuleService extends MedusaService({
       return { created: true, event: created }
     } catch (error: any) {
       const message = String(error?.message || "")
-      if (message.includes("paypal_webhook_event_event_id_unique") || message.includes("unique")) {
+      const code = String(error?.code || "")
+      if (
+        message.includes("paypal_webhook_event_event_id_unique") ||
+        code === "23505" ||
+        (message.includes("unique") && message.includes("event_id"))
+      ) {
         const existing = await this.listPayPalWebhookEvents({ event_id: input.event_id })
         return { created: false, event: existing?.[0] ?? null }
       }
@@ -1331,7 +1378,28 @@ class PayPalModuleService extends MedusaService({
     })
   }
 
-  async recordAuditEvent(_eventType: string, _metadata?: Record<string, unknown>) {
+  /**
+   * Emit an audit event as a single structured log line.
+   *
+   * The dedicated audit-log table was removed; for high-volume/containerized
+   * deployments the audit trail lives in aggregated stdout logs. This records a
+   * greppable `paypal_audit` line (filter on `"log":"paypal_audit"`) with
+   * sensitive keys redacted. It never throws — audit logging must not break the
+   * caller's payment flow.
+   */
+  async recordAuditEvent(eventType: string, metadata?: Record<string, unknown>) {
+    try {
+      console.info(
+        JSON.stringify({
+          log: "paypal_audit",
+          event_type: eventType,
+          at: new Date().toISOString(),
+          ...(metadata ? { metadata: redactSensitive(metadata) } : {}),
+        })
+      )
+    } catch {
+      // never let audit logging interfere with the payment flow
+    }
     return null
   }
 
@@ -1385,7 +1453,7 @@ class PayPalModuleService extends MedusaService({
     await Promise.all(
       urls.map(async (url) => {
         try {
-          const resp = await fetch(url, {
+          const resp = await paypalFetch(url, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",

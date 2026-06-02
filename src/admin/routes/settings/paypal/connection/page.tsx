@@ -11,36 +11,13 @@ import PayPalTabs from "../_components/Tabs"
 
 export const config = defineRouteConfig({
   label: "PayPal Connection",
-  hide: true,
 })
 
 
-if (typeof window !== "undefined") {
-  const preloadHref =
-    "https://www.paypal.com/webapps/merchantboarding/js/lib/lightbox/partner.js"
-
-  const existingPreload = document.head.querySelector(
-    `link[rel="preload"][href="${preloadHref}"]`
-  )
-  if (!existingPreload) {
-    const preloadLink = document.createElement("link")
-    preloadLink.rel = "preload"
-    preloadLink.href = preloadHref
-    preloadLink.as = "script"
-    document.head.appendChild(preloadLink)
-  }
-
-  const existingScript = document.getElementById(
-    "paypal-partner-js"
-  ) as HTMLScriptElement | null
-  if (!existingScript) {
-    const ppScript = document.createElement("script")
-    ppScript.id = "paypal-partner-js"
-    ppScript.src = preloadHref
-    ppScript.async = true
-    document.head.appendChild(ppScript)
-  }
-}
+const PARTNER_JS_URLS = {
+  sandbox: "https://www.sandbox.paypal.com/webapps/merchantboarding/js/lib/lightbox/partner.js",
+  live: "https://www.paypal.com/webapps/merchantboarding/js/lib/lightbox/partner.js",
+} as const
 
 declare global {
   interface Window {
@@ -59,7 +36,6 @@ declare global {
 
 const SERVICE_URL = "/admin/paypal/onboarding-link"
 const CACHE_KEY = "pp_onboard_cache"
-const RELOAD_KEY = "pp_onboard_reloaded_once"
 const CACHE_EXPIRY = 10 * 60 * 1000
 
 const ONBOARDING_COMPLETE_ENDPOINT = "/admin/paypal/onboard-complete"
@@ -87,7 +63,7 @@ export default function PayPalConnectionPage() {
   const [env, setEnv] = useState<"sandbox" | "live">("live")
 
   useEffect(() => {
-    fetch("/admin/paypal/environment", { method: "GET" })
+    fetch("/admin/paypal/environment", { method: "GET", credentials: "include" })
       .then((r) => r.json())
       .then((d) => {
         const v = d?.environment === "sandbox" ? "sandbox" : "live"
@@ -95,6 +71,7 @@ export default function PayPalConnectionPage() {
       })
       .catch(() => {})
   }, [])
+
   const [connState, setConnState] = useState<
     "loading" | "ready" | "connected" | "error"
   >("loading")
@@ -112,7 +89,7 @@ export default function PayPalConnectionPage() {
   const [onboardingInProgress, setOnboardingInProgress] = useState(false)
 
   const initLoaderRef = useRef<HTMLDivElement>(null)
-  const paypalButtonRef = useRef<HTMLAnchorElement>(null)
+  const paypalButtonRef = useRef<HTMLAnchorElement | null>(null)
   const errorLogRef = useRef<HTMLDivElement>(null)
   const runIdRef = useRef(0)
   const currentRunId = useRef(0)
@@ -123,6 +100,11 @@ export default function PayPalConnectionPage() {
   const canSaveManual = useMemo(() => {
     return clientId.trim().length > 0 && secret.trim().length > 0
   }, [clientId, secret])
+
+  const showError = useCallback((msg: string) => {
+    setConnState("error")
+    setError(msg)
+  }, [])
 
   const fetchFreshLink = useCallback(
     (runId: number) => {
@@ -135,11 +117,15 @@ export default function PayPalConnectionPage() {
       fetch(SERVICE_URL, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({
           products: ["PPCP"],
         }),
       })
-        .then((r) => r.json())
+        .then((r) => {
+          if (!r.ok) throw new Error(`Service returned ${r.status}`)
+          return r.json()
+        })
         .then((data) => {
           if (runId !== currentRunId.current) return
 
@@ -149,66 +135,50 @@ export default function PayPalConnectionPage() {
             return
           }
 
-          const finalUrl =
+          const url =
             href + (href.includes("?") ? "&" : "?") + "displayMode=minibrowser"
 
           localStorage.setItem(
             CACHE_KEY,
-            JSON.stringify({
-              url: finalUrl,
-              ts: Date.now(),
-            })
+            JSON.stringify({ url, ts: Date.now() })
           )
 
-          if (!localStorage.getItem(RELOAD_KEY)) {
-            localStorage.setItem(RELOAD_KEY, "1")
-            window.location.reload()
-            return
-          }
-
-          activatePayPal(finalUrl, runId)
+          setFinalUrl(url)
+          setConnState("ready")
         })
         .catch(() => {
           if (runId !== currentRunId.current) return
           showError("Unable to connect to service.")
         })
     },
-    [env]
+    [env, showError]
   )
 
-  const showUI = useCallback(() => {
-    const btn = document.querySelector('[data-paypal-button="true"]')
-    if (btn && window.PAYPAL?.apps?.Signup?.miniBrowser?.init) {
-      window.PAYPAL.apps.Signup.miniBrowser.init()
+  useEffect(() => {
+    if (connState !== "ready" || !finalUrl) return
+
+    const scriptUrl = PARTNER_JS_URLS[env]
+
+    const existingScript = document.getElementById("paypal-partner-js")
+    if (existingScript) {
+      existingScript.parentNode?.removeChild(existingScript)
     }
-    setConnState("ready")
-  }, [])
+    if (window.PAYPAL?.apps?.Signup) {
+      delete (window.PAYPAL.apps as any).Signup
+    }
 
-  const showError = useCallback((msg: string) => {
-    setConnState("error")
-    setError(msg)
-  }, [])
+    const ppScript = document.createElement("script")
+    ppScript.id = "paypal-partner-js"
+    ppScript.src = scriptUrl
+    ppScript.async = true
+    document.body.appendChild(ppScript)
 
-  const activatePayPal = useCallback(
-    (url: string, runId: number) => {
-      if (paypalButtonRef.current) {
-        paypalButtonRef.current.href = url
+    return () => {
+      if (ppScript.parentNode) {
+        ppScript.parentNode.removeChild(ppScript)
       }
-      setFinalUrl(url)
-
-      const tryInit = () => {
-        if (runId !== currentRunId.current) return
-        if (window.PAYPAL?.apps?.Signup) {
-          showUI()
-          return
-        }
-        setTimeout(tryInit, 50)
-      }
-
-      tryInit()
-    },
-    [showUI]
-  )
+    }
+  }, [connState, finalUrl, env])
 
   useEffect(() => {
     currentRunId.current = ++runIdRef.current
@@ -224,6 +194,7 @@ export default function PayPalConnectionPage() {
       try {
         const r = await fetch(`${STATUS_ENDPOINT}?environment=${env}`, {
           method: "GET",
+          credentials: "include",
         })
         const st = await r.json().catch(() => ({}))
 
@@ -244,7 +215,8 @@ export default function PayPalConnectionPage() {
       }
 
       if (cachedUrl) {
-        activatePayPal(cachedUrl, runId)
+        setFinalUrl(cachedUrl)
+        setConnState("ready")
       } else {
         fetchFreshLink(runId)
       }
@@ -256,12 +228,12 @@ export default function PayPalConnectionPage() {
       cancelled = true
       currentRunId.current = 0
     }
-  }, [env, fetchFreshLink, activatePayPal])
+  }, [env, fetchFreshLink])
 
   useLayoutEffect(() => {
     window.onboardingCallback = async function (authCode: string, sharedId: string) {
       try {
-        ;(window as any).onbeforeunload = ""
+        window.onbeforeunload = null
       } catch {}
 
       setOnboardingInProgress(true)
@@ -278,6 +250,7 @@ export default function PayPalConnectionPage() {
         const res = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
           method: "POST",
           headers: { "content-type": "application/json" },
+          credentials: "include",
           body: JSON.stringify(payload),
         })
 
@@ -299,10 +272,22 @@ export default function PayPalConnectionPage() {
 
         try {
           localStorage.removeItem(CACHE_KEY)
-          localStorage.removeItem(RELOAD_KEY)
         } catch {}
 
-        window.location.href = window.location.href
+        try {
+          const statusRes = await fetch(`${STATUS_ENDPOINT}?environment=${env}`, {
+            method: "GET",
+            credentials: "include",
+          })
+          const refreshedStatus = await statusRes.json().catch(() => ({}))
+          setStatusInfo(refreshedStatus || null)
+          setConnState("connected")
+          setShowManual(false)
+        } catch {
+          setConnState("connected")
+          setShowManual(false)
+        }
+        setOnboardingInProgress(false)
       } catch (e: any) {
         console.error(e)
         setConnState("error")
@@ -357,6 +342,7 @@ export default function PayPalConnectionPage() {
       const res = await fetch(SAVE_CREDENTIALS_ENDPOINT, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({
           clientId: clientId.trim(),
           clientSecret: secret.trim(),
@@ -371,6 +357,7 @@ export default function PayPalConnectionPage() {
 
       const statusRes = await fetch(`${STATUS_ENDPOINT}?environment=${env}`, {
         method: "GET",
+        credentials: "include",
       })
       const refreshedStatus = await statusRes.json().catch(() => ({}))
 
@@ -380,7 +367,6 @@ export default function PayPalConnectionPage() {
 
       try {
         localStorage.removeItem(CACHE_KEY)
-        localStorage.removeItem(RELOAD_KEY)
       } catch {}
     } catch (e: any) {
       console.error(e)
@@ -400,11 +386,13 @@ export default function PayPalConnectionPage() {
     setError(null)
     setFinalUrl("")
     setShowManual(false)
+    setStatusInfo(null)
 
     try {
       const res = await fetch(DISCONNECT_ENDPOINT, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ environment: env }),
       })
 
@@ -415,7 +403,7 @@ export default function PayPalConnectionPage() {
 
       try {
         localStorage.removeItem(CACHE_KEY)
-        localStorage.removeItem(RELOAD_KEY)
+
       } catch {}
 
       currentRunId.current = ++runIdRef.current
@@ -439,20 +427,24 @@ export default function PayPalConnectionPage() {
       await fetch("/admin/paypal/environment", {
         method: "POST",
         headers: { "content-type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ environment: next }),
       })
     } catch {}
 
     try {
       localStorage.removeItem(CACHE_KEY)
-      localStorage.removeItem(RELOAD_KEY)
     } catch {}
   }
 
   return (
     <div className="p-6">
       <div className="flex flex-col gap-6">
-        <h1 className="text-xl font-semibold">PayPal Gateway By Easy Payment</h1>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-xl font-semibold text-ui-fg-base">PayPal Gateway By Easy Payment</h1>
+          </div>
+        </div>
 
         <PayPalTabs />
 
@@ -481,6 +473,7 @@ export default function PayPalConnectionPage() {
                   <div className="text-sm text-green-600 bg-green-50 p-3 rounded border border-green-200">
                     ✅ Successfully connected to PayPal!
                     <a
+                      target="_blank"
                       data-paypal-button="true"
                       data-paypal-onboard-complete="onboardingCallback"
                       href="#"
@@ -535,6 +528,7 @@ export default function PayPalConnectionPage() {
                         ppBtnMeasureRef.current = node
                       }}
                       id="paypal-button"
+                      target="_blank"
                       data-paypal-button="true"
                       href={finalUrl || "#"}
                       data-paypal-onboard-complete="onboardingCallback"
@@ -604,8 +598,9 @@ export default function PayPalConnectionPage() {
               <div className="md:col-span-2">
                 <div className="ml-[260px] max-w-xl mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
                   <div className="flex flex-col gap-1">
-                    <label className="text-sm font-medium">Client ID</label>
+                    <label htmlFor="pp-manual-client-id" className="text-sm font-medium">Client ID</label>
                     <input
+                      id="pp-manual-client-id"
                       type="text"
                       value={clientId}
                       onChange={(e) => setClientId(e.target.value)}
@@ -618,8 +613,9 @@ export default function PayPalConnectionPage() {
                   </div>
 
                   <div className="flex flex-col gap-1">
-                    <label className="text-sm font-medium">Secret</label>
+                    <label htmlFor="pp-manual-secret" className="text-sm font-medium">Secret</label>
                     <input
+                      id="pp-manual-secret"
                       type="password"
                       value={secret}
                       onChange={(e) => setSecret(e.target.value)}

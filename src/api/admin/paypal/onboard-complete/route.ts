@@ -25,10 +25,11 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     })
 
     return res.json({ ok: true })
-  } catch (e: any) {
-    console.error("[PayPal] onboard-complete failed", e)
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e)
+    console.error("[PayPal] onboard-complete failed:", message)
     return res.status(500).json({
-      message: e?.message || "Failed to exchange and save PayPal credentials",
+      message: "Failed to exchange and save PayPal credentials",
     })
   }
 }

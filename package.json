@@ -1,6 +1,6 @@
 {
   "name": "@easypayment/medusa-payment-paypal",
-  "version": "0.8.6",
+  "version": "0.9.17",
   "description": "PayPal integration for Medusa v2",
   "author": "EasyPayment Plugins",
   "license": "MIT",
@@ -36,6 +36,8 @@
   "scripts": {
     "build": "medusa plugin:build",
     "develop": "medusa plugin:develop",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
@@ -47,7 +49,8 @@
     "@medusajs/ui": "^4.0.0",
     "@medusajs/icons": "2.12.5",
     "@swc/core": "^1.5.7",
-    "typescript": "^5.6.2"
+    "typescript": "^5.6.2",
+    "vitest": "^2.0.5"
   },
   "peerDependencies": {
     "@medusajs/admin-sdk": "^2.12.0",

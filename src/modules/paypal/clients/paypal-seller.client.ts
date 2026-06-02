@@ -1,3 +1,5 @@
+import { paypalFetch } from "../utils/paypal-fetch"
+
 export class PayPalSellerClient {
   private static readonly BN_CODE = "MBJTechnolabs_SI_SPB"
 
@@ -19,7 +21,7 @@ export class PayPalSellerClient {
   }
 
   async createOrder(body: any) {
-    const res = await fetch(`${this.baseUrl()}/v2/checkout/orders`, {
+    const res = await paypalFetch(`${this.baseUrl()}/v2/checkout/orders`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
@@ -30,7 +32,7 @@ export class PayPalSellerClient {
   }
 
   async getOrder(orderId: string) {
-    const res = await fetch(`${this.baseUrl()}/v2/checkout/orders/${orderId}`, {
+    const res = await paypalFetch(`${this.baseUrl()}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
       method: "GET",
       headers: this.headers(),
     })
@@ -40,7 +42,7 @@ export class PayPalSellerClient {
   }
 
   async captureOrder(orderId: string) {
-    const res = await fetch(`${this.baseUrl()}/v2/checkout/orders/${orderId}/capture`, {
+    const res = await paypalFetch(`${this.baseUrl()}/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, {
       method: "POST",
       headers: this.headers(),
     })
@@ -50,7 +52,7 @@ export class PayPalSellerClient {
   }
 
   async refundCapture(captureId: string, body?: any) {
-    const res = await fetch(`${this.baseUrl()}/v2/payments/captures/${captureId}/refund`, {
+    const res = await paypalFetch(`${this.baseUrl()}/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
       method: "POST",
       headers: this.headers(),
       body: body ? JSON.stringify(body) : "{}",

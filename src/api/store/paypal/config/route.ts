@@ -94,7 +94,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       button_height: paypalSettings.buttonHeight ?? 45,
       button_label: paypalSettings.buttonLabel || "paypal",
     })
-  } catch (e: any) {
-    return res.status(500).json({ message: e?.message || "Failed to load PayPal config" })
+  } catch {
+    return res.status(500).json({ message: "Failed to load PayPal config" })
   }
 }

@@ -52,11 +52,32 @@ function resolveAmount(resource: any): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
+function resolveCurrencyCode(resource: any): string | undefined {
+  const amount =
+    resource?.amount ||
+    resource?.purchase_units?.[0]?.amount ||
+    resource?.purchase_units?.[0]?.payments?.captures?.[0]?.amount ||
+    resource?.purchase_units?.[0]?.payments?.authorizations?.[0]?.amount
+  return amount?.currency_code || undefined
+}
+
 function resolveEventType(payload: ProviderWebhookPayload["payload"]) {
   const raw = payload as { event_type?: string; eventType?: string }
   return raw?.event_type || raw?.eventType
 }
 
+/**
+ * Maps a PayPal webhook payload to the generic Medusa payment-provider webhook
+ * result (the `getWebhookActionAndData` hook on AbstractPaymentProvider).
+ *
+ * NOTE: the authoritative webhook handling for this plugin is the dedicated
+ * `/store/paypal/webhook` route (signature verification, replay window,
+ * dedup, dead-letter retry). This helper exists only for the framework's
+ * generic `/hooks/payment/:provider` path. The `session_id` returned here is
+ * derived from the PayPal resource `custom_id`, which this plugin sets to the
+ * cart id (see create-order) — so consumers must resolve the cart, not treat
+ * it as a payment-session id directly.
+ */
 export function getPayPalWebhookActionAndData(
   payload: ProviderWebhookPayload["payload"]
 ): WebhookActionResult {

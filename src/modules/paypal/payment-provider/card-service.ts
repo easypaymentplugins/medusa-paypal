@@ -25,7 +25,8 @@ import type {
   WebhookActionResult,
 } from "@medusajs/framework/types"
 import { getPayPalWebhookActionAndData } from "./webhook-utils"
-import { formatAmountForPayPal, getCurrencyExponent } from "../utils/amounts"
+import { formatAmountForPayPal } from "../utils/amounts"
+import { paypalFetch } from "../utils/paypal-fetch"
 import {
   assertPayPalCurrencySupported,
   normalizeCurrencyCode,
@@ -68,24 +69,10 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
   private async resolveSettings() {
     const paypal = this.resolvePayPalService()
     if (!paypal) {
-      try {
-        const { Pool: _SettingsPool } = require("pg")
-        const _sPool = new _SettingsPool({ connectionString: process.env.DATABASE_URL })
-        const _sResult = await _sPool
-          .query("SELECT data FROM paypal_settings ORDER BY created_at DESC LIMIT 1")
-          .finally(() => _sPool.end())
-        const _sData = _sResult.rows[0]?.data || {}
-        return {
-          additionalSettings: (_sData.additional_settings || {}) as Record<string, any>,
-          advancedCardSettings: (_sData.advanced_card_payments || {}) as Record<string, any>,
-          apiDetails: (_sData.api_details || {}) as Record<string, any>,
-        }
-      } catch {
-        return {
-          additionalSettings: {} as Record<string, any>,
-          advancedCardSettings: {} as Record<string, any>,
-          apiDetails: {} as Record<string, any>,
-        }
+      return {
+        additionalSettings: {} as Record<string, any>,
+        advancedCardSettings: {} as Record<string, any>,
+        apiDetails: {} as Record<string, any>,
       }
     }
     const settings = await paypal.getSettings().catch(() => ({}))
@@ -110,60 +97,21 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
 
   private async getPayPalAccessToken() {
     const paypal = this.resolvePayPalService()
-    let client_id: string
-    let client_secret: string
-    let environment: string
-
     if (!paypal) {
-      const { Pool: _FbPool } = require("pg")
-      const _fbPool = new _FbPool({ connectionString: process.env.DATABASE_URL })
-      const _fbResult = await _fbPool
-        .query(
-          "SELECT metadata, environment, seller_client_id, seller_client_secret FROM paypal_connection WHERE status='connected' ORDER BY created_at DESC LIMIT 1"
-        )
-        .finally(() => _fbPool.end())
-      const _fbRow = _fbResult.rows[0]
-      if (!_fbRow) throw new Error("No active PayPal connection found in DB")
-      environment = _fbRow.environment || "sandbox"
-      const _fbCreds = (_fbRow.metadata?.credentials?.[environment]) || {}
-      client_id = _fbCreds.client_id || _fbRow.seller_client_id
-      client_secret = _fbCreds.client_secret || _fbRow.seller_client_secret
-      console.info("[PayPal Card] getPayPalAccessToken fallback via DB for env:", environment)
-    } else {
-      const creds = await paypal.getActiveCredentials()
-      client_id = creds.client_id
-      client_secret = creds.client_secret
-      environment = creds.environment
+      throw new Error("PayPal service is not available. Cannot obtain access token without a valid PayPal connection.")
     }
-
+    const creds = await paypal.getActiveCredentials()
     const base =
-      environment === "live"
+      creds.environment === "live"
         ? "https://api-m.paypal.com"
         : "https://api-m.sandbox.paypal.com"
-    const auth = Buffer.from(`${client_id}:${client_secret}`).toString("base64")
-
-    const resp = await fetch(`${base}/v1/oauth2/token`, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${auth}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "PayPal-Partner-Attribution-Id": BN_CODE,
-      },
-      body: "grant_type=client_credentials",
-    })
-
-    const text = await resp.text()
-    if (!resp.ok) {
-      throw new Error(`PayPal token error (${resp.status}): ${text}`)
-    }
-
-    const json = JSON.parse(text)
-    return { accessToken: String(json.access_token), base }
+    const accessToken = await paypal.getAppAccessToken()
+    return { accessToken, base }
   }
 
   private async getOrderDetails(orderId: string) {
     const { accessToken, base } = await this.getPayPalAccessToken()
-    const resp = await fetch(`${base}/v2/checkout/orders/${orderId}`, {
+    const resp = await paypalFetch(`${base}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -329,6 +277,8 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
         ? additionalSettings.paymentAction
         : "capture"
     const orderIntent = paymentActionRaw === "authorize" ? "AUTHORIZE" : "CAPTURE"
+    const returnStatus = paymentActionRaw === "authorize" ? "authorized" : "captured"
+    const timestampKey = paymentActionRaw === "authorize" ? "authorized_at" : "captured_at"
     const threeDsRaw =
       typeof advancedCardSettings.threeDS === "string"
         ? advancedCardSettings.threeDS
@@ -349,8 +299,24 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
       throw new Error(`Card brand ${cardBrand} is disabled by admin settings.`)
     }
 
-    const { accessToken, base } = await this.getPayPalAccessToken()
     const existingPayPal = (data.paypal || {}) as Record<string, any>
+
+    if (
+      existingPayPal.capture_id ||
+      existingPayPal.authorization_id ||
+      (data as any).authorized_at ||
+      (data as any).captured_at
+    ) {
+      return {
+        status: returnStatus,
+        data: {
+          ...(_input.data || {}),
+          [timestampKey]: (data as any)[timestampKey] || new Date().toISOString(),
+        },
+      }
+    }
+
+    const { accessToken, base } = await this.getPayPalAccessToken()
     let orderId = String(existingPayPal.order_id || data.order_id || "")
     let order: Record<string, any> | null = null
     let authorization: Record<string, any> | null = null
@@ -385,7 +351,7 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
           : {}),
       }
 
-      const ppResp = await fetch(`${base}/v2/checkout/orders`, {
+      const ppResp = await paypalFetch(`${base}/v2/checkout/orders`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -418,11 +384,28 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
 
     const existingAuthorization =
       order?.purchase_units?.[0]?.payments?.authorizations?.[0] || null
+    const existingCapture =
+      order?.purchase_units?.[0]?.payments?.captures?.[0] || null
 
     if (existingAuthorization) {
       authorization = order
+    } else if (existingCapture) {
+      return {
+        status: returnStatus,
+        data: {
+          ...(data || {}),
+          paypal: {
+            ...existingPayPal,
+            order_id: orderId,
+            order,
+            capture_id: existingCapture.id,
+            capture: existingCapture,
+          },
+          [timestampKey]: new Date().toISOString(),
+        },
+      }
     } else {
-      const authorizeResp = await fetch(`${base}/v2/checkout/orders/${orderId}/authorize`, {
+      const authorizeResp = await paypalFetch(`${base}/v2/checkout/orders/${encodeURIComponent(orderId)}/authorize`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -513,7 +496,7 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
       order?.intent || paypalData.order?.intent || data.intent || ""
     ).toUpperCase()
     if (!authorizationId && resolvedIntent === "AUTHORIZE") {
-      const authorizeResp = await fetch(`${base}/v2/checkout/orders/${orderId}/authorize`, {
+      const authorizeResp = await paypalFetch(`${base}/v2/checkout/orders/${encodeURIComponent(orderId)}/authorize`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -541,13 +524,12 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
       data.is_final_capture ??
       data.final_capture ??
       undefined
-    const captureExponent = getCurrencyExponent(currencyCode || "EUR")
     const capturePayload =
       amount > 0
         ? {
             amount: {
               currency_code: currencyCode || "EUR",
-              value: amount.toFixed(captureExponent),
+              value: formatAmountForPayPal(amount, currencyCode || "EUR"),
             },
             ...(typeof isFinalCapture === "boolean"
               ? { is_final_capture: isFinalCapture }
@@ -560,10 +542,10 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
           }
 
     const captureUrl = authorizationId
-      ? `${base}/v2/payments/authorizations/${authorizationId}/capture`
-      : `${base}/v2/checkout/orders/${orderId}/capture`
+      ? `${base}/v2/payments/authorizations/${encodeURIComponent(authorizationId)}/capture`
+      : `${base}/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`
 
-    const ppResp = await fetch(captureUrl, {
+    const ppResp = await paypalFetch(captureUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -613,9 +595,108 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
 
   async cancelPayment(_input: CancelPaymentInput): Promise<CancelPaymentOutput> {
     const data = (_input.data || {}) as Record<string, any>
+    const paypalData = (data.paypal || {}) as Record<string, any>
+    const orderId = String(paypalData.order_id || data.order_id || "")
+    const captureId = String(paypalData.capture_id || data.capture_id || "")
+    const storedAuthorizationId = String(
+      paypalData.authorization_id || data.authorization_id || ""
+    )
+
+    const order = orderId ? await this.getOrderDetails(orderId) : null
+    const intent = String(order?.intent || "").toUpperCase()
+    const authorizationId =
+      order?.purchase_units?.[0]?.payments?.authorizations?.[0]?.id ||
+      storedAuthorizationId
+
+    if (intent === "AUTHORIZE" && authorizationId) {
+      const { accessToken, base } = await this.getPayPalAccessToken()
+      const requestId = this.getIdempotencyKey(_input, `void-${authorizationId}`)
+
+      const resp = await paypalFetch(
+        `${base}/v2/payments/authorizations/${encodeURIComponent(authorizationId)}/void`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+            "PayPal-Request-Id": requestId,
+            "PayPal-Partner-Attribution-Id": BN_CODE,
+          },
+        }
+      )
+
+      if (!resp.ok) {
+        const text = await resp.text()
+        const debugId = resp.headers.get("paypal-debug-id")
+        throw new Error(
+          `PayPal void error (${resp.status}): ${text}${
+            debugId ? ` debug_id=${debugId}` : ""
+          }`
+        )
+      }
+    } else if (captureId) {
+      const { accessToken, base } = await this.getPayPalAccessToken()
+      const requestId = this.getIdempotencyKey(_input, `cancel-refund-${captureId}`)
+
+      const resp = await paypalFetch(
+        `${base}/v2/payments/captures/${encodeURIComponent(captureId)}/refund`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+            "PayPal-Request-Id": requestId,
+            "PayPal-Partner-Attribution-Id": BN_CODE,
+          },
+          body: JSON.stringify({}),
+        }
+      )
+
+      if (!resp.ok) {
+        const text = await resp.text()
+        const debugId = resp.headers.get("paypal-debug-id")
+        throw new Error(
+          `PayPal refund error (${resp.status}): ${text}${
+            debugId ? ` debug_id=${debugId}` : ""
+          }`
+        )
+      }
+
+      const refund = await resp.json().catch(() => ({}))
+      const existingRefunds = Array.isArray(paypalData.refunds) ? paypalData.refunds : []
+      const refundEntry = {
+        id: refund?.id,
+        status: refund?.status,
+        amount: refund?.amount,
+        raw: refund,
+      }
+
+      return {
+        data: {
+          ...(data || {}),
+          paypal: {
+            ...paypalData,
+            order: order || undefined,
+            authorization_id: authorizationId || storedAuthorizationId,
+            capture_id: captureId || paypalData.capture_id,
+            refund_id: refund?.id,
+            refund_status: refund?.status,
+            refunds: [...existingRefunds, refundEntry],
+          },
+          canceled_at: new Date().toISOString(),
+        },
+      }
+    }
+
     return {
       data: {
         ...(data || {}),
+        paypal: {
+          ...paypalData,
+          order: order || undefined,
+          authorization_id: authorizationId || storedAuthorizationId,
+          capture_id: captureId || paypalData.capture_id,
+        },
         canceled_at: new Date().toISOString(),
       },
     }
@@ -626,32 +707,29 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
     const paypalData = (data.paypal || {}) as Record<string, any>
     const captureId = String(paypalData.capture_id || data.capture_id || "")
     if (!captureId) {
-      return {
-        data: {
-          ...(data || {}),
-          refunded_at: new Date().toISOString(),
-        },
-      }
+      throw new Error("PayPal capture_id is required to refund payment. No capture found in session data.")
     }
 
     const requestId = this.getIdempotencyKey(_input, `refund-${captureId}`)
-    const amount = Number(data.amount ?? 0)
+    // Use the refund amount Medusa passes (top-level input), not the session
+    // amount in `data` — otherwise a partial refund would refund the full order.
+    const amount = Number(_input.amount ?? 0)
+    const currencyOverride = await this.resolveCurrencyOverride()
     const currencyCode = normalizeCurrencyCode(
-      data.currency_code || process.env.PAYPAL_CURRENCY || "EUR"
+      data.currency_code || currencyOverride || "EUR"
     )
     const { accessToken, base } = await this.getPayPalAccessToken()
-    const refundExponent = getCurrencyExponent(currencyCode)
     const refundPayload: Record<string, any> =
       amount > 0
         ? {
             amount: {
               currency_code: currencyCode,
-              value: amount.toFixed(refundExponent),
+              value: formatAmountForPayPal(amount, currencyCode),
             },
           }
         : {}
 
-    const resp = await fetch(`${base}/v2/payments/captures/${captureId}/refund`, {
+    const resp = await paypalFetch(`${base}/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,

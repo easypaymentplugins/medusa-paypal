@@ -13,7 +13,7 @@ const PayPalWebhookEvent = model.define("paypal_webhook_event", {
   processed_at: model.dateTime().nullable(),
   last_error: model.text().nullable(),
   resource_id: model.text().nullable(),
-  payload: model.json().nullable(),
+  payload: model.json().default({}),
 })
 
 export default PayPalWebhookEvent

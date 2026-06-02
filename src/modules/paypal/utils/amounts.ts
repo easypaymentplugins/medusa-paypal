@@ -3,12 +3,18 @@ const ZERO_DECIMAL_CURRENCIES = new Set([
   "CLP",
   "DJF",
   "GNF",
+  // PayPal does NOT support decimals for HUF, JPY and TWD — even though HUF and
+  // TWD have 2 ISO 4217 minor digits, PayPal rejects amounts like "1000.00" for
+  // them (DECIMAL_PRECISION). They must be sent as whole numbers ("1000").
+  // See https://developer.paypal.com/api/rest/reference/currency-codes/
+  "HUF",
   "JPY",
   "KMF",
   "KRW",
   "MGA",
   "PYG",
   "RWF",
+  "TWD",
   "UGX",
   "VND",
   "VUV",
@@ -17,7 +23,7 @@ const ZERO_DECIMAL_CURRENCIES = new Set([
   "XPF",
 ])
 
-const THREE_DECIMAL_CURRENCIES = new Set(["BHD", "JOD", "KWD", "OMR", "TND"])
+const THREE_DECIMAL_CURRENCIES = new Set(["BHD", "IQD", "JOD", "KWD", "OMR", "TND"])
 
 export function getCurrencyExponent(currencyCode: string) {
   const code = currencyCode.toUpperCase()
@@ -30,12 +36,15 @@ export function getCurrencyExponent(currencyCode: string) {
   return 2
 }
 
-export function formatAmountForPayPal(
-  minorAmount: number,
-  currencyCode: string
-) {
+/**
+ * Format a Medusa amount for the PayPal REST API.
+ *
+ * Medusa passes monetary amounts to payment providers in MAJOR units
+ * (e.g. `10` for €10.00), and PayPal's Orders/Payments API also expects major
+ * units as a string (e.g. `"10.00"`). So this only fixes the decimal precision
+ * for the currency — it must NOT divide/convert to minor units.
+ */
+export function formatAmountForPayPal(amount: number, currencyCode: string) {
   const exponent = getCurrencyExponent(currencyCode)
-  const factor = 10 ** exponent
-  const majorAmount = Number(minorAmount || 0) / factor
-  return majorAmount.toFixed(exponent)
+  return Number(amount || 0).toFixed(exponent)
 }

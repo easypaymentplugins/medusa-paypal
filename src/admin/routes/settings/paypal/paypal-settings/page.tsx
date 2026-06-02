@@ -1,38 +1,9 @@
-import React, { useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import PayPalTabs from "../_components/Tabs"
-
-type AdminFetchOptions = {
-  method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH"
-  body?: Record<string, unknown>
-  query?: Record<string, string>
-}
-
-async function adminFetch<T = unknown>(path: string, opts: AdminFetchOptions = {}): Promise<T> {
-  const { method = "GET", body, query } = opts
-  let url = path
-  if (query && Object.keys(query).length > 0) {
-    const params = new URLSearchParams(query)
-    url = `${path}?${params.toString()}`
-  }
-  const headers: Record<string, string> = { Accept: "application/json" }
-  if (body !== undefined) headers["Content-Type"] = "application/json"
-  if (typeof window !== "undefined") {
-    const token = (window as any).__medusa__?.token
-    if (token) headers["Authorization"] = `Bearer ${token}`
-  }
-  const res = await fetch(url, {
-    method, headers, credentials: "include",
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  })
-  const text = await res.text().catch(() => "")
-  if (!res.ok) {
-    if (res.status === 401) throw new Error("Unauthorized (401) - session may have expired. Please reload and log in again.")
-    if (res.status === 403) throw new Error("Forbidden (403) - you do not have permission to perform this action.")
-    throw new Error(text || `Request failed with status ${res.status}`)
-  }
-  if (!text) return {} as T
-  try { return JSON.parse(text) as T } catch { return {} as T }
-}
+import SectionCard from "../_components/SectionCard"
+import FieldRow from "../_components/FieldRow"
+import Toast, { ToastState } from "../_components/Toast"
+import { adminFetch } from "../_utils/adminFetch"
 
 type ButtonColor = "gold" | "blue" | "silver" | "black" | "white"
 type ButtonShape = "rect" | "pill"
@@ -79,51 +50,6 @@ const LABEL_OPTIONS: { value: ButtonLabel; label: string }[] = [
   { value: "pay", label: "Pay" },
 ]
 
-function SectionCard({
-  title,
-  description,
-  children,
-  right,
-}: {
-  title: string
-  description?: string
-  children: React.ReactNode
-  right?: React.ReactNode
-}) {
-  return (
-    <div className="rounded-xl border border-ui-border-base bg-ui-bg-base shadow-sm">
-      <div className="flex items-start justify-between gap-4 border-b border-ui-border-base p-4">
-        <div>
-          <div className="text-base font-semibold text-ui-fg-base">{title}</div>
-          {description ? <div className="mt-1 text-sm text-ui-fg-subtle">{description}</div> : null}
-        </div>
-        {right}
-      </div>
-      <div className="p-4">{children}</div>
-    </div>
-  )
-}
-
-function FieldRow({
-  label,
-  hint,
-  children,
-}: {
-  label: string
-  hint?: React.ReactNode
-  children: React.ReactNode
-}) {
-  return (
-    <div className="grid grid-cols-12 items-start gap-4 py-3">
-      <div className="col-span-12 md:col-span-4">
-        <div className="text-sm font-medium text-ui-fg-base">{label}</div>
-        {hint ? <div className="mt-1 text-xs text-ui-fg-subtle">{hint}</div> : null}
-      </div>
-      <div className="col-span-12 md:col-span-8">{children}</div>
-    </div>
-  )
-}
-
 export default function PayPalSettingsTab() {
   const [form, setForm] = useState<PayPalSettingsForm>({
     enabled: true,
@@ -137,8 +63,10 @@ export default function PayPalSettingsTab() {
   })
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null)
+  const [toast, setToast] = useState<ToastState>(null)
   const didInit = useRef(false)
+
+  const dismissToast = useCallback(() => setToast(null), [])
 
   useEffect(() => {
     if (didInit.current) return
@@ -184,16 +112,14 @@ export default function PayPalSettingsTab() {
           ...saved,
         }))
       }
-      setToast({ type: "success", message: "Settings saved" })
-      window.setTimeout(() => setToast(null), 2500)
+      setToast({ kind: "success", message: "Settings saved" })
     } catch (e: unknown) {
       setToast({
-        type: "error",
+        kind: "error",
         message:
           (e instanceof Error ? e.message : "") ||
           "Failed to save settings.",
       })
-      window.setTimeout(() => setToast(null), 3500)
     } finally {
       setSaving(false)
     }
@@ -213,17 +139,7 @@ export default function PayPalSettingsTab() {
 
         <PayPalTabs />
 
-        {toast ? (
-          <div
-            className="fixed right-6 top-6 z-50 rounded-md border border-ui-border-base bg-ui-bg-base px-4 py-3 text-sm shadow-lg"
-            role="status"
-            aria-live="polite"
-          >
-            <span className={toast.type === "success" ? "text-ui-fg-base" : "text-ui-fg-error"}>
-              {toast.message}
-            </span>
-          </div>
-        ) : null}
+        <Toast toast={toast} onClose={dismissToast} />
 
         <SectionCard
           title="PayPal Settings"
@@ -255,8 +171,9 @@ export default function PayPalSettingsTab() {
               </label>
             </FieldRow>
 
-            <FieldRow label="Title">
+            <FieldRow label="Title" htmlFor="pp-title">
               <input
+                id="pp-title"
                 value={form.title}
                 onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))}
                 className="w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive"
@@ -273,8 +190,9 @@ export default function PayPalSettingsTab() {
         >
           <div className="divide-y divide-ui-border-base">
 
-            <FieldRow label="Button Color">
+            <FieldRow label="Button Color" htmlFor="pp-btn-color">
               <select
+                id="pp-btn-color"
                 value={form.buttonColor}
                 onChange={(e) => setForm((p) => ({ ...p, buttonColor: e.target.value as ButtonColor }))}
                 className="w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive"
@@ -287,8 +205,9 @@ export default function PayPalSettingsTab() {
               </select>
             </FieldRow>
 
-            <FieldRow label="Button Shape">
+            <FieldRow label="Button Shape" htmlFor="pp-btn-shape">
               <select
+                id="pp-btn-shape"
                 value={form.buttonShape}
                 onChange={(e) => setForm((p) => ({ ...p, buttonShape: e.target.value as ButtonShape }))}
                 className="w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive"
@@ -301,8 +220,9 @@ export default function PayPalSettingsTab() {
               </select>
             </FieldRow>
 
-            <FieldRow label="Button Width">
+            <FieldRow label="Button Width" htmlFor="pp-btn-width">
               <select
+                id="pp-btn-width"
                 value={form.buttonWidth}
                 onChange={(e) => setForm((p) => ({ ...p, buttonWidth: e.target.value as ButtonWidth }))}
                 className="w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive"
@@ -315,8 +235,9 @@ export default function PayPalSettingsTab() {
               </select>
             </FieldRow>
 
-            <FieldRow label="Button Height">
+            <FieldRow label="Button Height" htmlFor="pp-btn-height">
               <select
+                id="pp-btn-height"
                 value={String(form.buttonHeight)}
                 onChange={(e) => setForm((p) => ({ ...p, buttonHeight: Number(e.target.value) }))}
                 className="w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive"
@@ -329,8 +250,9 @@ export default function PayPalSettingsTab() {
               </select>
             </FieldRow>
 
-            <FieldRow label="Button Label">
+            <FieldRow label="Button Label" htmlFor="pp-btn-label">
               <select
+                id="pp-btn-label"
                 value={form.buttonLabel}
                 onChange={(e) => setForm((p) => ({ ...p, buttonLabel: e.target.value as ButtonLabel }))}
                 className="w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive"

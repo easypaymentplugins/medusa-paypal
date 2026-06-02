@@ -1,6 +1,7 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import type PayPalModuleService from "../modules/paypal/service"
-import { getPayPalAccessToken } from "../modules/paypal/utils/paypal-auth"
+import { getPayPalApiBase } from "../modules/paypal/utils/paypal-auth"
+import { paypalFetch } from "../modules/paypal/utils/paypal-fetch"
 import { isPayPalProviderId } from "../modules/paypal/utils/provider-ids"
 
 const PATCHABLE_STATUSES = new Set(["CREATED", "APPROVED", "SAVED"])
@@ -83,13 +84,14 @@ export default async function paypalOrderInvoiceHandler({
     if (!invoiceId) return
 
     const creds = await paypal.getActiveCredentials()
-    const { accessToken, base } = await getPayPalAccessToken(creds)
+    const base = getPayPalApiBase(creds.environment)
+    const accessToken = await paypal.getAppAccessToken()
 
     let paypalOrderStatus = ""
     let currentInvoiceId = ""
     try {
-      const statusResp = await fetch(
-        `${base}/v2/checkout/orders/${paypalOrderId}`,
+      const statusResp = await paypalFetch(
+        `${base}/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       )
       if (statusResp.ok) {
@@ -128,8 +130,8 @@ export default async function paypalOrderInvoiceHandler({
       return
     }
 
-    const patchResp = await fetch(
-      `${base}/v2/checkout/orders/${paypalOrderId}`,
+    const patchResp = await paypalFetch(
+      `${base}/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}`,
       {
         method: "PATCH",
         headers: {
@@ -138,8 +140,8 @@ export default async function paypalOrderInvoiceHandler({
         },
         body: JSON.stringify([
           {
-            op: "replace",
-            path: "/purchase_units/@reference_id=='default'/invoice_id",
+            op: currentInvoiceId ? "replace" : "add",
+            path: "/purchase_units/0/invoice_id",
             value: invoiceId,
           },
         ]),

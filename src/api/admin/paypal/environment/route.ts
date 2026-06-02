@@ -19,7 +19,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     await paypal.setEnvironment(env)
     const status = await paypal.getStatus()
     return res.json(status)
-  } catch (e: any) {
-    return res.status(500).json({ message: e?.message || "Unknown error" })
+  } catch {
+    return res.status(500).json({ message: "Failed to update environment" })
   }
 }

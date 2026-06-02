@@ -15,7 +15,8 @@ type Props = {
 export default function Toast({ toast, onClose }: Props) {
   useEffect(() => {
     if (!toast) return
-    const t = setTimeout(() => onClose(), 2500)
+    const duration = toast.kind === "error" ? 5000 : 2500
+    const t = setTimeout(() => onClose(), duration)
     return () => clearTimeout(t)
   }, [toast, onClose])
 
@@ -30,8 +31,8 @@ export default function Toast({ toast, onClose }: Props) {
           "min-w-[280px] max-w-[420px] rounded-lg border px-4 py-3 shadow-md",
           isSuccess ? "border-emerald-500/30 bg-emerald-500/10" : "border-rose-500/30 bg-rose-500/10",
         ].join(" ")}
-        role="status"
-        aria-live="polite"
+        role={isSuccess ? "status" : "alert"}
+        aria-live={isSuccess ? "polite" : "assertive"}
       >
         <div className="flex items-start gap-3">
           <div className={["mt-0.5 h-2.5 w-2.5 rounded-full", isSuccess ? "bg-emerald-500" : "bg-rose-500"].join(" ")} />

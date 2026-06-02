@@ -1,4 +1,5 @@
 import type { MedusaContainer } from "@medusajs/framework/types"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type PayPalModuleService from "../modules/paypal/service"
 import {
   computeNextRetryAt,
@@ -8,11 +9,60 @@ import {
   processPayPalWebhookEvent,
 } from "../modules/paypal/webhook-processor"
 
+// Bound how many failed events one run drains so the cron can't load an
+// unbounded backlog into memory.
+const RETRY_BATCH_SIZE = 100
+
+// Stable key for the Postgres advisory lock that serializes this cron across
+// instances. pg_try_advisory_xact_lock auto-releases at transaction end, so
+// there is no unlock to pair (and no risk of a leaked lock).
+const RETRY_ADVISORY_LOCK_KEY = 838907812
+
 export default async function paypalWebhookRetry(container: MedusaContainer) {
+  // Run the sweep under a Postgres advisory lock so that with multiple server
+  // instances running this cron, only one drains the queue per cycle (each
+  // event is processed at most once). Falls back to running directly if the
+  // raw connection isn't resolvable, so the job degrades gracefully rather
+  // than breaking.
+  let pg: any = null
+  try {
+    pg = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  } catch {
+    pg = null
+  }
+
+  if (!pg?.transaction) {
+    await runRetrySweep(container)
+    return
+  }
+
+  try {
+    await pg.transaction(async (trx: any) => {
+      const res = await trx.raw(
+        "SELECT pg_try_advisory_xact_lock(?) AS locked",
+        [RETRY_ADVISORY_LOCK_KEY]
+      )
+      const locked = res?.rows?.[0]?.locked ?? res?.[0]?.locked ?? false
+      if (!locked) {
+        console.info("[PayPal] webhook-retry: another instance holds the lock, skipping")
+        return
+      }
+      await runRetrySweep(container)
+    })
+  } catch (e: any) {
+    console.warn("[PayPal] webhook-retry: advisory lock path failed, running unlocked:", e?.message)
+    await runRetrySweep(container)
+  }
+}
+
+async function runRetrySweep(container: MedusaContainer) {
   const paypal = container.resolve<PayPalModuleService>("paypal_onboarding")
   const now = Date.now()
 
-  const candidates = await paypal.listPayPalWebhookEvents({ status: "failed" })
+  const candidates = await paypal.listPayPalWebhookEvents(
+    { status: "failed" },
+    { take: RETRY_BATCH_SIZE, order: { next_retry_at: "ASC" } }
+  )
   if (!candidates?.length) return
 
   console.info(

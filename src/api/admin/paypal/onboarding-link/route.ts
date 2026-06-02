@@ -33,7 +33,7 @@ export async function POST(req: AuthenticatedMedusaRequest, res: MedusaResponse)
   } catch (e: any) {
     console.error("[paypal_onboarding] onboarding-link error:", e?.message || e, e?.stack)
     return res.status(500).json({
-      message: e?.message || "Unknown error",
+      message: "Failed to generate PayPal onboarding link",
     })
   }
 }

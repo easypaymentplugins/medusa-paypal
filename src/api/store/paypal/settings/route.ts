@@ -11,9 +11,9 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
 
     return res.json({
       paymentAction: additionalSettings.paymentAction === "authorize" ? "authorize" : "capture",
-      advancedCardEnabled: advancedCard.enabled === true,
+      advancedCardEnabled: advancedCard.enabled !== false,
     })
-  } catch (e: any) {
-    return res.status(500).json({ message: e?.message || "Failed to load PayPal settings" })
+  } catch {
+    return res.status(500).json({ message: "Failed to load PayPal settings" })
   }
 }

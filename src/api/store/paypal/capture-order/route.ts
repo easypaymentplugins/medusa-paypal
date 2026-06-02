@@ -1,12 +1,19 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
-import type { IPaymentModuleService } from "@medusajs/framework/types"
-import { Modules } from "@medusajs/framework/utils"
+import type { Logger } from "@medusajs/framework/types"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { randomUUID } from "crypto"
 import type PayPalModuleService from "../../../../modules/paypal/service"
-import { getPayPalAccessToken } from "../../../../modules/paypal/utils/paypal-auth"
-import { isPayPalProviderId } from "../../../../modules/paypal/utils/provider-ids"
+import { getPayPalApiBase } from "../../../../modules/paypal/utils/paypal-auth"
+import { paypalFetch } from "../../../../modules/paypal/utils/paypal-fetch"
+import {
+  findPayPalSessionForCart,
+  getStoredPayPalOrderId,
+  updatePayPalSessionData,
+} from "../../../../modules/paypal/utils/payment-session"
 
 const BN_CODE = "MBJTechnolabs_SI_SPB"
+
+const PAYPAL_ORDER_ID_RE = /^[A-Z0-9]{10,25}$/
 
 type Body = {
   cart_id: string
@@ -26,72 +33,6 @@ function resolveIdempotencyKey(req: MedusaRequest, suffix: string, fallback: str
   return fallback || `pp-${suffix}-${randomUUID()}`
 }
 
-async function findPayPalSessionForCart(
-  cartId: string,
-  scope: any
-): Promise<{
-  session_id: string
-  session_data: Record<string, any>
-  session_status: string
-} | null> {
-  try {
-    const query = scope.resolve("query")
-    const { data: carts } = await query.graph({
-      entity: "cart",
-      fields: [
-        "id",
-        "payment_collection.payment_sessions.id",
-        "payment_collection.payment_sessions.data",
-        "payment_collection.payment_sessions.status",
-        "payment_collection.payment_sessions.provider_id",
-        "payment_collection.payment_sessions.created_at",
-      ],
-      filters: { id: cartId },
-    })
-    const cart = carts?.[0]
-    const sessions = cart?.payment_collection?.payment_sessions || []
-    const session = sessions
-      .filter((s: any) => isPayPalProviderId(s.provider_id))
-      .sort(
-        (a: any, b: any) =>
-          new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
-      )[0]
-
-    if (!session) return null
-
-    return {
-      session_id: session.id,
-      session_data: (session.data || {}) as Record<string, any>,
-      session_status: session.status,
-    }
-  } catch (e: any) {
-    console.warn("[PayPal] findPayPalSessionForCart failed:", e?.message)
-    return null
-  }
-}
-
-async function updatePayPalSession(
-  sessionId: string,
-  status: string,
-  extraData: Record<string, any>,
-  scope: any
-): Promise<void> {
-  try {
-    const paymentModule = scope.resolve(Modules.PAYMENT) as IPaymentModuleService
-    const [existing] = await paymentModule.listPaymentSessions({ id: [sessionId] }, { take: 1 })
-    const mergedData = { ...(existing?.data || {}), ...extraData }
-    await (paymentModule as any).updatePaymentSession({
-      id: sessionId,
-      data: mergedData,
-      status: status as any,
-      amount: existing?.amount,
-      currency_code: existing?.currency_code,
-    })
-  } catch (e: any) {
-    console.error("[PayPal] updatePayPalSession failed:", e?.message)
-  }
-}
-
 async function attachPayPalCaptureToSession(
   cartId: string,
   orderId: string,
@@ -107,9 +48,8 @@ async function attachPayPalCaptureToSession(
 
     const captureId = capture?.purchase_units?.[0]?.payments?.captures?.[0]?.id || capture?.id
 
-    await updatePayPalSession(
+    await updatePayPalSessionData(
       session.session_id,
-      "captured",
       {
         paypal: {
           ...((session.session_data || {}).paypal || {}),
@@ -140,9 +80,8 @@ async function attachPayPalAuthorizationToSession(
 
     const authorizationId = authorization?.purchase_units?.[0]?.payments?.authorizations?.[0]?.id
 
-    await updatePayPalSession(
+    await updatePayPalSessionData(
       session.session_id,
-      "authorized",
       {
         paypal: {
           ...((session.session_data || {}).paypal || {}),
@@ -176,6 +115,8 @@ async function getExistingCapture(cartId: string, orderId: string, scope: any) {
 
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const paypal = req.scope.resolve<PayPalModuleService>("paypal_onboarding")
+  const logger = req.scope.resolve<Logger>(ContainerRegistrationKeys.LOGGER)
+  const requestId = randomUUID()
   const { scope } = req
   let debugId: string | null = null
 
@@ -188,13 +129,41 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       return res.status(400).json({ message: "cart_id and order_id are required" })
     }
 
+    if (typeof cartId !== "string" || !cartId.startsWith("cart_")) {
+      return res.status(400).json({ message: "Invalid cart_id format" })
+    }
+
+    if (!PAYPAL_ORDER_ID_RE.test(orderId)) {
+      return res.status(400).json({ message: "Invalid order_id format" })
+    }
+
+    // Bind the capture to the cart's own PayPal session, fail-closed: the
+    // order_id MUST be the one this cart's session created (stored by
+    // create-order). This prevents capturing an arbitrary, caller-supplied
+    // order_id against the merchant account.
+    const session = await findPayPalSessionForCart(cartId, scope)
+    const sessionOrderId = getStoredPayPalOrderId(session?.session_data)
+    if (!session || !sessionOrderId) {
+      return res.status(409).json({
+        message: "No PayPal order is associated with this cart's payment session",
+      })
+    }
+    if (sessionOrderId !== orderId) {
+      return res.status(400).json({
+        message: "order_id does not match the payment session for this cart",
+      })
+    }
+
     const existingCapture = await getExistingCapture(cartId, orderId, scope)
     if (existingCapture) {
       return res.json({ capture: existingCapture })
     }
 
     const creds = await paypal.getActiveCredentials()
-    const { accessToken, base } = await getPayPalAccessToken(creds)
+    // Cached app access token (single-flight refresh) — avoids an OAuth
+    // round-trip on every capture-order call.
+    const base = getPayPalApiBase(creds.environment)
+    const accessToken = await paypal.getAppAccessToken()
     const settings = await paypal.getSettings().catch(() => ({}))
     const data =
       settings && typeof settings === "object" && "data" in settings
@@ -207,12 +176,13 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         : "capture"
 
     const requestId = resolveIdempotencyKey(req, "capture-order", `pp-capture-${orderId}`)
+    const safeOrderId = encodeURIComponent(orderId)
     const endpoint =
       paymentAction === "authorize"
-        ? `${base}/v2/checkout/orders/${orderId}/authorize`
-        : `${base}/v2/checkout/orders/${orderId}/capture`
+        ? `${base}/v2/checkout/orders/${safeOrderId}/authorize`
+        : `${base}/v2/checkout/orders/${safeOrderId}/capture`
 
-    const ppResp = await fetch(endpoint, {
+    const ppResp = await paypalFetch(endpoint, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -249,17 +219,26 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       ? res.json({ authorization: payload })
       : res.json({ capture: payload })
   } catch (e: any) {
+    const body = (req.body || {}) as Body
+    logger.error(
+      `[paypal] capture-order failed (request_id=${requestId}, cart_id=${
+        body.cart_id ?? "n/a"
+      }, order_id=${body.order_id ?? "n/a"}, debug_id=${debugId ?? "n/a"}): ${
+        e?.message ?? String(e)
+      }`,
+      e instanceof Error ? e : undefined
+    )
     try {
-      const body = (req.body || {}) as Body
       await paypal.recordAuditEvent("capture_order_failed", {
         cart_id: body.cart_id,
         order_id: body.order_id,
         debug_id: debugId,
+        request_id: requestId,
         message: e?.message || String(e),
       })
       await paypal.recordMetric("capture_order_failed")
     } catch {
     }
-    return res.status(500).json({ message: e?.message || "Failed to capture PayPal order" })
+    return res.status(500).json({ message: "Failed to capture PayPal order", request_id: requestId })
   }
 }

@@ -1,13 +1,20 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import type { Logger } from "@medusajs/framework/types"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { randomUUID } from "crypto"
 import { getCurrencyExponent } from "../../../../modules/paypal/utils/amounts"
 import {
   assertPayPalCurrencySupported,
   normalizeCurrencyCode,
 } from "../../../../modules/paypal/utils/currencies"
-import { getPayPalAccessToken } from "../../../../modules/paypal/utils/paypal-auth"
+import { getPayPalApiBase } from "../../../../modules/paypal/utils/paypal-auth"
+import { paypalFetch } from "../../../../modules/paypal/utils/paypal-fetch"
 import type PayPalModuleService from "../../../../modules/paypal/service"
-import { isPayPalProviderId } from "../../../../modules/paypal/utils/provider-ids"
+import {
+  findPayPalSessionForCart,
+  getStoredPayPalOrderId,
+  updatePayPalSessionData,
+} from "../../../../modules/paypal/utils/payment-session"
 
 const BN_CODE = "MBJTechnolabs_SI_SPB"
 
@@ -29,61 +36,35 @@ function resolveIdempotencyKey(req: MedusaRequest, suffix: string, fallback: str
   return fallback || `pp-${suffix}-${randomUUID()}`
 }
 
+// Persist the PayPal order id onto the cart's PayPal payment session so that
+// capture-order can bind the capture to the order this cart created. Resolved
+// through the Payment module service (the previous direct-container resolve of
+// "payment_collection"/"payment_session" did not exist in the request scope, so
+// the id was silently never stored and every capture failed fail-closed).
 async function attachPayPalOrderToSession(
   req: MedusaRequest,
   cartId: string,
   orderId: string
 ) {
-  try {
-    const paymentCollectionService = req.scope.resolve("payment_collection") as any
-    const paymentSessionService = req.scope.resolve("payment_session") as any
-
-    const pc = await paymentCollectionService.retrieveByCartId(cartId).catch(() => null)
-    if (!pc?.id) {
-      return
-    }
-
-    const sessions = await paymentSessionService.list({ payment_collection_id: pc.id })
-    const paypalSession = sessions?.find((s: any) => isPayPalProviderId(s.provider_id))
-    if (!paypalSession) {
-      return
-    }
-
-    await paymentSessionService.update(paypalSession.id, {
-      amount: paypalSession.amount,
-      data: {
-        ...(paypalSession.data || {}),
-        paypal: {
-          ...((paypalSession.data || {}).paypal || {}),
-          order_id: orderId,
-        },
-      },
-    })
-  } catch {
+  const session = await findPayPalSessionForCart(cartId, req.scope)
+  if (!session) {
+    return
   }
+  await updatePayPalSessionData(
+    session.session_id,
+    {
+      paypal: {
+        ...(session.session_data.paypal || {}),
+        order_id: orderId,
+      },
+    },
+    req.scope
+  )
 }
 
 async function getExistingPayPalOrderId(req: MedusaRequest, cartId: string) {
-  try {
-    const paymentCollectionService = req.scope.resolve("payment_collection") as any
-    const paymentSessionService = req.scope.resolve("payment_session") as any
-
-    const pc = await paymentCollectionService.retrieveByCartId(cartId).catch(() => null)
-    if (!pc?.id) {
-      return null
-    }
-
-    const sessions = await paymentSessionService.list({ payment_collection_id: pc.id })
-    const paypalSession = sessions?.find((s: any) => isPayPalProviderId(s.provider_id))
-    if (!paypalSession) {
-      return null
-    }
-
-    const paypalData = (paypalSession.data || {}).paypal || {}
-    return paypalData.order_id ? String(paypalData.order_id) : null
-  } catch {
-    return null
-  }
+  const session = await findPayPalSessionForCart(cartId, req.scope)
+  return getStoredPayPalOrderId(session?.session_data)
 }
 
 function resolveReturnUrl(req: MedusaRequest) {
@@ -104,6 +85,8 @@ function resolveCancelUrl(req: MedusaRequest) {
 
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const paypal = req.scope.resolve<PayPalModuleService>("paypal_onboarding")
+  const logger = req.scope.resolve<Logger>(ContainerRegistrationKeys.LOGGER)
+  const requestId = randomUUID()
   let debugId: string | null = null
 
   try {
@@ -111,8 +94,12 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     const cartId = body.cart_id
     const isCardPayment = !!(body as any).is_card_payment
 
-    if (!cartId) {
+    if (!cartId || typeof cartId !== "string") {
       return res.status(400).json({ message: "cart_id is required" })
+    }
+
+    if (!cartId.startsWith("cart_")) {
+      return res.status(400).json({ message: "Invalid cart_id format" })
     }
 
     const existingOrderId = await getExistingPayPalOrderId(req, cartId)
@@ -290,87 +277,115 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     )
     const roundedItemSumFixed = parseFloat(roundedItemSum.toFixed(exponent))
 
-    const adjustedItemTotal = roundedItemSumFixed
-
-    const diff = parseFloat((adjustedItemTotal - roundedItemSumFixed).toFixed(exponent))
-
     const finalPurchaseItems = purchaseItemsRaw.map((item: any) => item.paypalItem)
 
-    if (Math.abs(diff) > 0.000001 && sendItemDetails && finalPurchaseItems.length > 0) {
-      finalPurchaseItems.push({
-        name: "Line Item Amount Offset",
-        quantity: "1",
-        unit_amount: {
-          currency_code: currency,
-          value: diff.toFixed(exponent),
-        },
-      })
+    // Reconcile rounding drift so the items we send sum to the cart subtotal.
+    if (finalPurchaseItems.length > 0) {
+      const diff = parseFloat((subtotalMajor - roundedItemSumFixed).toFixed(exponent))
+      if (Math.abs(diff) > 0.000001) {
+        finalPurchaseItems.push({
+          name: "Line Item Amount Offset",
+          quantity: "1",
+          unit_amount: {
+            currency_code: currency,
+            value: diff.toFixed(exponent),
+          },
+        })
+      }
     }
 
-    const breakdown: Record<string, any> = {}
-    if (adjustedItemTotal > 0) {
-      breakdown.item_total = {
-        currency_code: currency,
-        value: adjustedItemTotal.toFixed(exponent),
-      }
-    }
-    if (shippingMajor > 0) {
-      breakdown.shipping = {
-        currency_code: currency,
-        value: shippingMajor.toFixed(exponent),
-      }
-    }
-    if (taxMajor > 0) {
-      breakdown.tax_total = {
-        currency_code: currency,
-        value: taxMajor.toFixed(exponent),
-      }
-    }
+    // Only send line items (and an item_total) when we actually have them.
+    const sendItems = finalPurchaseItems.length > 0
+
+    // item_total MUST equal the exact sum of (unit_amount * quantity) of the
+    // items we send; otherwise PayPal rejects with ITEM_TOTAL_MISMATCH.
+    const itemsTotalMajor = sendItems
+      ? parseFloat(
+          finalPurchaseItems
+            .reduce(
+              (sum: number, it: any) =>
+                sum + Number(it.unit_amount.value) * Number(it.quantity),
+              0
+            )
+            .toFixed(exponent)
+        )
+      : 0
 
     const discountValue = discountMajor + giftCardMajor
-    if (discountValue > 0 && finalPurchaseItems.length > 0) {
-      breakdown.discount = {
-        currency_code: currency,
-        value: discountValue.toFixed(exponent),
+
+    // Build a breakdown only when we send line items. A breakdown whose
+    // item_total has no matching items (or items with no item_total) is
+    // rejected by PayPal, so with no items we send just the order total.
+    const breakdown: Record<string, any> = {}
+    if (sendItems) {
+      if (itemsTotalMajor > 0) {
+        breakdown.item_total = {
+          currency_code: currency,
+          value: itemsTotalMajor.toFixed(exponent),
+        }
       }
-    }
-
-    const breakdownSum = parseFloat(
-      (adjustedItemTotal + shippingMajor + taxMajor - discountValue).toFixed(exponent)
-    )
-
-    if (Math.abs(breakdownSum - totalMajor) > 0.000001) {
-      const gap = parseFloat((totalMajor - breakdownSum).toFixed(exponent))
-
-      if (gap > 0) {
+      if (shippingMajor > 0) {
+        breakdown.shipping = {
+          currency_code: currency,
+          value: shippingMajor.toFixed(exponent),
+        }
+      }
+      if (taxMajor > 0) {
         breakdown.tax_total = {
           currency_code: currency,
-          value: parseFloat(
-            ((Number(breakdown.tax_total?.value || 0) + gap).toFixed(exponent))
-          ).toFixed(exponent),
+          value: taxMajor.toFixed(exponent),
         }
-      } else {
-        breakdown.shipping_discount = {
+      }
+      if (discountValue > 0) {
+        breakdown.discount = {
           currency_code: currency,
-          value: Math.abs(gap).toFixed(exponent),
+          value: discountValue.toFixed(exponent),
+        }
+      }
+
+      const breakdownSum = parseFloat(
+        (itemsTotalMajor + shippingMajor + taxMajor - discountValue).toFixed(exponent)
+      )
+
+      if (Math.abs(breakdownSum - totalMajor) > 0.000001) {
+        const gap = parseFloat((totalMajor - breakdownSum).toFixed(exponent))
+
+        if (gap > 0) {
+          breakdown.tax_total = {
+            currency_code: currency,
+            value: parseFloat(
+              ((Number(breakdown.tax_total?.value || 0) + gap).toFixed(exponent))
+            ).toFixed(exponent),
+          }
+        } else {
+          breakdown.shipping_discount = {
+            currency_code: currency,
+            value: Math.abs(gap).toFixed(exponent),
+          }
         }
       }
     }
 
-    const { accessToken, base } = await getPayPalAccessToken({
-      environment: creds.environment,
-      client_id: creds.client_id,
-      client_secret: creds.client_secret,
-    })
+    logger.debug(
+      `[paypal] create-order line items (request_id=${requestId}): send_item_details=${sendItemDetails}, cart_items=${lineItems.length}, sent_items=${finalPurchaseItems.length}, items_total=${itemsTotalMajor}, subtotal=${subtotalMajor}, total=${totalMajor}`
+    )
 
-    const requestId = resolveIdempotencyKey(req, "create-order", `pp-create-${cart.id}`)
+    // Use the module's cached app access token (single-flight refresh, ~9h TTL)
+    // instead of minting a fresh OAuth token on every create-order call.
+    const base = getPayPalApiBase(creds.environment)
+    const accessToken = await paypal.getAppAccessToken()
 
-    const ppResp = await fetch(`${base}/v2/checkout/orders`, {
+    // Deterministic-per-cart idempotency key for the PayPal call. Kept distinct
+    // from `requestId` (the log/response correlation id declared at the top of
+    // POST) so the two never shadow each other.
+    const paypalRequestId = resolveIdempotencyKey(req, "create-order", `pp-create-${cart.id}`)
+
+    const ppResp = await paypalFetch(`${base}/v2/checkout/orders`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
-        "PayPal-Request-Id": requestId,
+        "PayPal-Request-Id": paypalRequestId,
         "PayPal-Partner-Attribution-Id": BN_CODE,
       },
       body: JSON.stringify({
@@ -378,6 +393,10 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
         purchase_units: [
           {
             reference_id: "default",
+            // Set custom_id on the purchase unit (not just the order) so PayPal
+            // propagates the cart id onto capture/refund webhook resources,
+            // letting webhooks resolve the session directly without a scan.
+            custom_id: cart.id,
             invoice_id: invoiceId,
             ...(statementName ? { soft_descriptor: statementName.slice(0, 22) } : {}),
             amount: {
@@ -428,22 +447,29 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     }
     return res.json({ id: order.id })
   } catch (e: any) {
+    const body = (req.body || {}) as Body
+    logger.error(
+      `[paypal] create-order failed (request_id=${requestId}, cart_id=${
+        body.cart_id ?? "n/a"
+      }, debug_id=${debugId ?? "n/a"}): ${e?.message ?? String(e)}`,
+      e instanceof Error ? e : undefined
+    )
     try {
-      const body = (req.body || {}) as Body
       await paypal.recordAuditEvent("create_order_failed", {
         cart_id: body.cart_id,
         debug_id: debugId,
+        request_id: requestId,
         message: e?.message || String(e),
       })
       await paypal.recordMetric("create_order_failed")
     } catch {
     }
-    const message = e?.message || "Failed to create PayPal order"
-    const status = message.includes("PayPal does not support currency")
-      ? 400
-      : message.includes("PayPal is configured for")
-        ? 400
-        : 500
-    return res.status(status).json({ message })
+    const rawMessage = e?.message || ""
+    const isCurrencyError =
+      rawMessage.includes("PayPal does not support currency") ||
+      rawMessage.includes("PayPal is configured for")
+    const status = isCurrencyError ? 400 : 500
+    const message = isCurrencyError ? rawMessage : "Failed to create PayPal order"
+    return res.status(status).json({ message, request_id: requestId })
   }
 }

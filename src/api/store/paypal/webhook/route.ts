@@ -1,5 +1,6 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import type PayPalModuleService from "../../../../modules/paypal/service"
+import { paypalFetch } from "../../../../modules/paypal/utils/paypal-fetch"
 import {
   computeNextRetryAt,
   isAllowedEventType,
@@ -140,6 +141,16 @@ async function verifyWebhookSignature(
     webhook_event: body,
   }
 
+  const certUrl = verifyPayload.cert_url
+  if (
+    certUrl &&
+    !certUrl.startsWith("https://www.paypal.com/") &&
+    !certUrl.startsWith("https://api-m.paypal.com/") &&
+    !certUrl.startsWith("https://api-m.sandbox.paypal.com/")
+  ) {
+    throw new Error("Invalid paypal-cert-url: must originate from paypal.com")
+  }
+
   const missing = Object.entries(verifyPayload)
     .filter(([k, v]) => k !== "webhook_id" && k !== "webhook_event" && !v)
     .map(([k]) => k)
@@ -148,7 +159,7 @@ async function verifyWebhookSignature(
     throw new Error(`Missing required PayPal webhook headers: ${missing.join(", ")}`)
   }
 
-  const resp = await fetch(`${base}/v1/notifications/verify-webhook-signature`, {
+  const resp = await paypalFetch(`${base}/v1/notifications/verify-webhook-signature`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -208,7 +219,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     console.error("[PayPal] webhook: signature verification failed:", e?.message)
     return res
       .status(401)
-      .json({ message: e?.message || "Webhook signature verification failed" })
+      .json({ message: "Webhook signature verification failed" })
   }
 
   const eventVersion = normalizeEventVersion(payload)
@@ -316,10 +327,10 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     await paypal.recordMetric("webhook_failed").catch(() => {})
 
     if (!retryable) {
-      return res.status(200).json({ ok: false, message: e?.message })
+      return res.status(200).json({ ok: false, message: "Webhook processing failed" })
     }
     return res
       .status(500)
-      .json({ message: e?.message || "PayPal webhook processing error" })
+      .json({ message: "PayPal webhook processing error" })
   }
 }
