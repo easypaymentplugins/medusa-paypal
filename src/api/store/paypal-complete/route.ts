@@ -1,9 +1,9 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import type { IPaymentModuleService, Logger } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
-import { completeCartWorkflow } from "@medusajs/core-flows"
 import { randomUUID } from "crypto"
 import { isPayPalProviderId } from "../../../modules/paypal/utils/provider-ids"
+import { runCoreWorkflow } from "../../../modules/paypal/utils/core-workflow"
 
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const logger = req.scope.resolve<Logger>(ContainerRegistrationKeys.LOGGER)
@@ -80,9 +80,11 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     }
 
     try {
-      const { result } = await completeCartWorkflow(req.scope).run({
-        input: { id: cart_id },
-      })
+      const { result } = await runCoreWorkflow<{ id: string }, { id?: string }>(
+        req.scope,
+        "complete-cart",
+        { id: cart_id }
+      )
       logger.info(
         `[paypal] paypal-complete cart completed (request_id=${requestId}, cart_id=${cart_id}, order_id=${result?.id})`
       )

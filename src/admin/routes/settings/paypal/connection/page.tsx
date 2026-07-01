@@ -13,19 +13,24 @@ export const config = defineRouteConfig({
   label: "PayPal Connection",
 })
 
-
-const PARTNER_JS_URLS = {
-  sandbox: "https://www.sandbox.paypal.com/webapps/merchantboarding/js/lib/lightbox/partner.js",
-  live: "https://www.paypal.com/webapps/merchantboarding/js/lib/lightbox/partner.js",
-} as const
+// Let partner.js own the entire onboarding flow: it opens PayPal's mini-browser
+// itself (synchronously inside the click, so no new tab / no popup block), it
+// receives PayPal's completion postMessage, and it invokes the callback named in
+// `data-paypal-onboard-complete` with (authCode, sharedId). This is PayPal's
+// documented integration and matches the official @easypayment WooCommerce
+// plugin. Opening the popup ourselves (a previous attempt at fixing the "opens a
+// new tab" issue) stopped partner.js from receiving completion, which left the
+// popup stranded on PayPal's "isuDone" page and never saved credentials.
+const PARTNER_JS_URL =
+  "https://www.paypal.com/webapps/merchantboarding/js/lib/lightbox/partner.js"
 
 declare global {
   interface Window {
     PAYPAL?: {
       apps?: {
         Signup?: {
-          miniBrowser?: { init: () => void }
-          MiniBrowser?: { closeFlow?: () => void }
+          miniBrowser?: { init?: () => void; closeFlow?: () => void }
+          MiniBrowser?: { init?: () => void; closeFlow?: () => void }
         }
       }
     }
@@ -33,44 +38,63 @@ declare global {
   }
 }
 
-
 const SERVICE_URL = "/admin/paypal/onboarding-link"
-const CACHE_KEY = "pp_onboard_cache"
-const CACHE_EXPIRY = 10 * 60 * 1000
+const CACHE_PREFIX = "pp_onboard_cache"
+const CACHE_EXPIRY = 6 * 60 * 60 * 1000 // 6 hours
 
 const ONBOARDING_COMPLETE_ENDPOINT = "/admin/paypal/onboard-complete"
 const STATUS_ENDPOINT = "/admin/paypal/status"
 const SAVE_CREDENTIALS_ENDPOINT = "/admin/paypal/save-credentials"
 const DISCONNECT_ENDPOINT = "/admin/paypal/disconnect"
+const ENVIRONMENT_ENDPOINT = "/admin/paypal/environment"
 
-let cachedUrl: string | null = null
-if (typeof window !== "undefined") {
+type Env = "sandbox" | "live"
+
+const cacheKeyFor = (env: Env) => `${CACHE_PREFIX}_${env}`
+
+function readCachedUrl(env: Env): string | null {
+  if (typeof window === "undefined") return null
   try {
-    const cached = localStorage.getItem(CACHE_KEY)
-    if (cached) {
-      const data = JSON.parse(cached)
-      if (new Date().getTime() - data.ts < CACHE_EXPIRY) {
-        cachedUrl = data.url
-      }
+    const raw = localStorage.getItem(cacheKeyFor(env))
+    if (!raw) return null
+    const data = JSON.parse(raw)
+    if (
+      data &&
+      typeof data.url === "string" &&
+      Date.now() - (Number(data.ts) || 0) < CACHE_EXPIRY
+    ) {
+      return data.url
     }
-  } catch (e) {
-    console.error("Cache read error:", e)
+  } catch {
+    /* ignore malformed cache */
+  }
+  return null
+}
+
+function writeCachedUrl(env: Env, url: string) {
+  try {
+    localStorage.setItem(cacheKeyFor(env), JSON.stringify({ url, ts: Date.now() }))
+  } catch {
+    /* ignore */
   }
 }
 
+function clearCachedUrl(env?: Env) {
+  try {
+    if (env) {
+      localStorage.removeItem(cacheKeyFor(env))
+    } else {
+      localStorage.removeItem(cacheKeyFor("sandbox"))
+      localStorage.removeItem(cacheKeyFor("live"))
+    }
+  } catch {
+    /* ignore */
+  }
+}
 
 export default function PayPalConnectionPage() {
-  const [env, setEnv] = useState<"sandbox" | "live">("live")
-
-  useEffect(() => {
-    fetch("/admin/paypal/environment", { method: "GET", credentials: "include" })
-      .then((r) => r.json())
-      .then((d) => {
-        const v = d?.environment === "sandbox" ? "sandbox" : "live"
-        setEnv(v)
-      })
-      .catch(() => {})
-  }, [])
+  const [env, setEnv] = useState<Env>("live")
+  const [envReady, setEnvReady] = useState(false)
 
   const [connState, setConnState] = useState<
     "loading" | "ready" | "connected" | "error"
@@ -93,6 +117,15 @@ export default function PayPalConnectionPage() {
   const errorLogRef = useRef<HTMLDivElement>(null)
   const runIdRef = useRef(0)
   const currentRunId = useRef(0)
+  const completedRef = useRef(false)
+
+  // Long-lived listeners/timers read the current env through a ref so they never
+  // capture a stale value from the render that registered them.
+  const envRef = useRef<Env>(env)
+  envRef.current = env
+
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pollAttemptsRef = useRef(0)
 
   const ppBtnMeasureRef = useRef<HTMLAnchorElement | null>(null)
   const [ppBtnWidth, setPpBtnWidth] = useState<number | null>(null)
@@ -106,85 +139,285 @@ export default function PayPalConnectionPage() {
     setError(msg)
   }, [])
 
-  const fetchFreshLink = useCallback(
-    (runId: number) => {
-      if (initLoaderRef.current) {
-        const loaderText = initLoaderRef.current.querySelector("#loader-text")
-        if (loaderText)
-          loaderText.textContent = "Generating onboarding session..."
+  // Close PayPal's mini-browser via partner.js's API (works under both the
+  // `miniBrowser` and `MiniBrowser` casings PayPal has shipped over time).
+  const closeMiniBrowser = useCallback(() => {
+    try {
+      const close1 = window.PAYPAL?.apps?.Signup?.MiniBrowser?.closeFlow
+      if (typeof close1 === "function") close1()
+    } catch {}
+    try {
+      const close2 = window.PAYPAL?.apps?.Signup?.miniBrowser?.closeFlow
+      if (typeof close2 === "function") close2()
+    } catch {}
+  }, [])
+
+  const stopStatusPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+    pollAttemptsRef.current = 0
+  }, [])
+
+  // Fetch status for an env and, if the seller credentials are present, flip the
+  // UI to "connected" and close the PayPal popup. Returns true once connected.
+  const refreshStatusAndMaybeConnect = useCallback(
+    async (activeEnv: Env): Promise<boolean> => {
+      try {
+        const res = await fetch(`${STATUS_ENDPOINT}?environment=${activeEnv}`, {
+          method: "GET",
+          credentials: "include",
+        })
+        const st = await res.json().catch(() => ({}))
+        const connected =
+          st?.status === "connected" && st?.seller_client_id_present === true
+        if (connected) {
+          completedRef.current = true
+          setStatusInfo(st)
+          setConnState("connected")
+          setShowManual(false)
+          setOnboardingInProgress(false)
+          clearCachedUrl(activeEnv)
+          closeMiniBrowser()
+          stopStatusPolling()
+        }
+        return connected
+      } catch {
+        return false
       }
-
-      fetch(SERVICE_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          products: ["PPCP"],
-        }),
-      })
-        .then((r) => {
-          if (!r.ok) throw new Error(`Service returned ${r.status}`)
-          return r.json()
-        })
-        .then((data) => {
-          if (runId !== currentRunId.current) return
-
-          const href = data?.onboarding_url
-          if (!href) {
-            showError("Onboarding URL not returned.")
-            return
-          }
-
-          const url =
-            href + (href.includes("?") ? "&" : "?") + "displayMode=minibrowser"
-
-          localStorage.setItem(
-            CACHE_KEY,
-            JSON.stringify({ url, ts: Date.now() })
-          )
-
-          setFinalUrl(url)
-          setConnState("ready")
-        })
-        .catch(() => {
-          if (runId !== currentRunId.current) return
-          showError("Unable to connect to service.")
-        })
     },
-    [env, showError]
+    [closeMiniBrowser, stopStatusPolling]
   )
 
-  useEffect(() => {
-    if (connState !== "ready" || !finalUrl) return
-
-    const scriptUrl = PARTNER_JS_URLS[env]
-
-    const existingScript = document.getElementById("paypal-partner-js")
-    if (existingScript) {
-      existingScript.parentNode?.removeChild(existingScript)
+  // While a connect attempt is in flight, the seller may complete onboarding via
+  // a path that never reaches the opener (e.g. partner.js fails to fire its
+  // callback, or the popup's completion message is blocked). The return_url
+  // bridge still saves credentials server-side, so poll status as the reliable
+  // fallback: the moment credentials land, this flips to "connected" and closes
+  // the stranded popup.
+  const startStatusPolling = useCallback(() => {
+    stopStatusPolling()
+    const MAX_ATTEMPTS = 100 // ~5 min at 3s intervals
+    const tick = async () => {
+      pollAttemptsRef.current += 1
+      const connected = await refreshStatusAndMaybeConnect(envRef.current)
+      if (connected || completedRef.current) return
+      if (pollAttemptsRef.current >= MAX_ATTEMPTS) {
+        stopStatusPolling()
+        return
+      }
+      pollTimerRef.current = setTimeout(tick, 3000)
     }
-    if (window.PAYPAL?.apps?.Signup) {
-      delete (window.PAYPAL.apps as any).Signup
+    pollTimerRef.current = setTimeout(tick, 3000)
+  }, [refreshStatusAndMaybeConnect, stopStatusPolling])
+
+  // Shared completion: exchange authCode/sharedId for seller credentials, then
+  // close the popup and refresh status. Invoked by partner.js's onboardingCallback
+  // and by the return_url bridge's postMessage. Guarded + server-idempotent so
+  // redundant invocations are harmless.
+  const completeOnboarding = useCallback(
+    async (authCode: string, sharedId: string) => {
+      if (!authCode || !sharedId) return
+      if (completedRef.current) return
+      completedRef.current = true
+
+      try {
+        window.onbeforeunload = null
+      } catch {}
+
+      const activeEnv: Env = envRef.current === "sandbox" ? "sandbox" : "live"
+
+      setOnboardingInProgress(true)
+      setConnState("loading")
+      setError(null)
+
+      try {
+        const res = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ authCode, sharedId, env: activeEnv }),
+        })
+
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "")
+          throw new Error(txt || `Onboarding exchange failed (${res.status})`)
+        }
+
+        closeMiniBrowser()
+        clearCachedUrl(activeEnv)
+
+        try {
+          const statusRes = await fetch(
+            `${STATUS_ENDPOINT}?environment=${activeEnv}`,
+            { method: "GET", credentials: "include" }
+          )
+          const refreshedStatus = await statusRes.json().catch(() => ({}))
+          setStatusInfo(refreshedStatus || null)
+        } catch {}
+
+        setConnState("connected")
+        setShowManual(false)
+        stopStatusPolling()
+      } catch (e: any) {
+        completedRef.current = false
+        console.error(e)
+        // The bridge may have already saved credentials server-side; if so the
+        // poll will surface "connected". Don't strand the user on an error.
+        setConnState("error")
+        setError(e?.message || "Exchange failed while saving credentials.")
+      } finally {
+        setOnboardingInProgress(false)
+      }
+    },
+    [closeMiniBrowser, stopStatusPolling]
+  )
+
+  // Bind partner.js to the connect button once it has a real onboarding URL.
+  const initPartner = useCallback(() => {
+    const signup = window.PAYPAL?.apps?.Signup
+    const init =
+      (signup?.miniBrowser && signup.miniBrowser.init) ||
+      (signup?.MiniBrowser && signup.MiniBrowser.init)
+    if (typeof init === "function") {
+      try {
+        init()
+      } catch (e) {
+        console.error("[paypal] partner.js init failed:", e)
+      }
+    }
+  }, [])
+
+  // Load partner.js once for the lifetime of the page.
+  useEffect(() => {
+    const existingScript = document.getElementById("paypal-partner-js")
+    if (existingScript) return
+
+    const preloadHref = PARTNER_JS_URL
+    let preloadLink: HTMLLinkElement | null = null
+    if (!document.head.querySelector(`link[rel="preload"][href="${preloadHref}"]`)) {
+      preloadLink = document.createElement("link")
+      preloadLink.rel = "preload"
+      preloadLink.href = preloadHref
+      preloadLink.as = "script"
+      document.head.appendChild(preloadLink)
     }
 
     const ppScript = document.createElement("script")
     ppScript.id = "paypal-partner-js"
-    ppScript.src = scriptUrl
+    ppScript.src = preloadHref
     ppScript.async = true
-    document.body.appendChild(ppScript)
+    document.head.appendChild(ppScript)
 
     return () => {
-      if (ppScript.parentNode) {
-        ppScript.parentNode.removeChild(ppScript)
-      }
+      if (preloadLink?.parentNode) preloadLink.parentNode.removeChild(preloadLink)
+      if (ppScript.parentNode) ppScript.parentNode.removeChild(ppScript)
     }
-  }, [connState, finalUrl, env])
+  }, [])
 
+  // Put the (cached or freshly generated) onboarding URL on the button, then wait
+  // for partner.js to be present before showing the button + initializing it. The
+  // button is only revealed once partner.js is ready, which is what guarantees
+  // the first click opens the mini-browser popup (never a new tab).
+  const activatePayPal = useCallback(
+    (url: string, runId: number) => {
+      if (paypalButtonRef.current) {
+        paypalButtonRef.current.href = url
+      }
+      setFinalUrl(url)
+
+      let attempts = 0
+      const MAX_ATTEMPTS = 200 // ~10s
+
+      const tryInit = () => {
+        if (runId !== currentRunId.current) return
+        if (window.PAYPAL?.apps?.Signup) {
+          initPartner()
+          setConnState("ready")
+          return
+        }
+        attempts++
+        if (attempts >= MAX_ATTEMPTS) {
+          showError(
+            "PayPal partner script failed to load. Please refresh and try again."
+          )
+          return
+        }
+        setTimeout(tryInit, 50)
+      }
+
+      tryInit()
+    },
+    [initPartner, showError]
+  )
+
+  const fetchFreshLink = useCallback(
+    async (targetEnv: Env, runId: number) => {
+      if (initLoaderRef.current) {
+        const loaderText = initLoaderRef.current.querySelector("#loader-text")
+        if (loaderText) loaderText.textContent = "Generating onboarding session..."
+      }
+
+      try {
+        const res = await fetch(SERVICE_URL, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ products: ["PPCP"], environment: targetEnv }),
+        })
+
+        if (!res.ok) throw new Error(`Service returned ${res.status}`)
+
+        const data = await res.json()
+        if (runId !== currentRunId.current) return
+
+        const href = data?.onboarding_url
+        if (!href) {
+          showError("Onboarding URL not returned.")
+          return
+        }
+
+        const url =
+          href + (href.includes("?") ? "&" : "?") + "displayMode=minibrowser"
+
+        writeCachedUrl(targetEnv, url)
+        activatePayPal(url, runId)
+      } catch {
+        if (runId !== currentRunId.current) return
+        showError("Unable to connect to service.")
+      }
+    },
+    [activatePayPal, showError]
+  )
+
+  // Resolve the server environment first.
   useEffect(() => {
+    let alive = true
+    fetch(ENVIRONMENT_ENDPOINT, { method: "GET", credentials: "include" })
+      .then((r) => r.json())
+      .then((d) => {
+        if (!alive) return
+        setEnv(d?.environment === "sandbox" ? "sandbox" : "live")
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (alive) setEnvReady(true)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // Page-load flow: connected? -> cached link? -> else generate a fresh link.
+  useEffect(() => {
+    if (!envReady) return
+
     currentRunId.current = ++runIdRef.current
     const runId = currentRunId.current
 
     let cancelled = false
+    completedRef.current = false
 
     const run = async () => {
       setConnState("loading")
@@ -214,92 +447,67 @@ export default function PayPalConnectionPage() {
         console.error(e)
       }
 
-      if (cachedUrl) {
-        setFinalUrl(cachedUrl)
-        setConnState("ready")
-      } else {
-        fetchFreshLink(runId)
+      if (cancelled || runId !== currentRunId.current) return
+
+      const cached = readCachedUrl(env)
+      if (cached) {
+        activatePayPal(cached, runId)
+        return
       }
+
+      await fetchFreshLink(env, runId)
     }
 
     run()
 
     return () => {
       cancelled = true
-      currentRunId.current = 0
     }
-  }, [env, fetchFreshLink])
+  }, [env, envReady, fetchFreshLink, activatePayPal])
 
+  // partner.js invokes this by name (data-paypal-onboard-complete) once PayPal
+  // returns the seller's authCode + sharedId.
   useLayoutEffect(() => {
-    window.onboardingCallback = async function (authCode: string, sharedId: string) {
-      try {
-        window.onbeforeunload = null
-      } catch {}
-
-      setOnboardingInProgress(true)
-      setConnState("loading")
-      setError(null)
-
-      const payload = {
-        authCode,
-        sharedId,
-        env: env === "sandbox" ? "sandbox" : "live",
-      }
-
-      try {
-        const res = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify(payload),
-        })
-
-        if (!res.ok) {
-          const txt = await res.text().catch(() => "")
-          throw new Error(txt || `Onboarding exchange failed (${res.status})`)
-        }
-
-        try {
-          const close1 = window.PAYPAL?.apps?.Signup?.MiniBrowser?.closeFlow
-          if (typeof close1 === "function") close1()
-        } catch {}
-        try {
-          const close2 =
-            window.PAYPAL?.apps?.Signup?.miniBrowser &&
-            (window.PAYPAL.apps.Signup.miniBrowser as any).closeFlow
-          if (typeof close2 === "function") close2()
-        } catch {}
-
-        try {
-          localStorage.removeItem(CACHE_KEY)
-        } catch {}
-
-        try {
-          const statusRes = await fetch(`${STATUS_ENDPOINT}?environment=${env}`, {
-            method: "GET",
-            credentials: "include",
-          })
-          const refreshedStatus = await statusRes.json().catch(() => ({}))
-          setStatusInfo(refreshedStatus || null)
-          setConnState("connected")
-          setShowManual(false)
-        } catch {
-          setConnState("connected")
-          setShowManual(false)
-        }
-        setOnboardingInProgress(false)
-      } catch (e: any) {
-        console.error(e)
-        setConnState("error")
-        setError(e?.message || "Exchange failed while saving credentials.")
-        setOnboardingInProgress(false)
-      }
+    window.onboardingCallback = (authCode: string, sharedId: string) => {
+      void completeOnboarding(authCode, sharedId)
     }
 
     return () => {
       window.onboardingCallback = undefined
     }
-  }, [env])
+  }, [completeOnboarding])
+
+  // The return_url bridge (/store/paypal/onboard-return), which runs inside the
+  // popup after PayPal redirects to it, posts its params back here. The bridge has
+  // already exchanged credentials server-side, so we just refresh status to flip
+  // to "connected" and close the popup. If for some reason credentials aren't yet
+  // saved but PayPal forwarded an authCode/sharedId, complete it from here too.
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const data = event?.data as
+        | { source?: string; params?: Record<string, string> }
+        | undefined
+      if (!data || data.source !== "paypal-onboarding-return") return
+
+      const params = data.params || {}
+      const authCode = params.authCode || params.auth_code
+      const sharedId = params.sharedId || params.shared_id
+      const activeEnv = envRef.current
+
+      void (async () => {
+        const connected = await refreshStatusAndMaybeConnect(activeEnv)
+        if (!connected && authCode && sharedId) {
+          await completeOnboarding(authCode, sharedId)
+        }
+      })()
+    }
+
+    window.addEventListener("message", onMessage)
+    return () => window.removeEventListener("message", onMessage)
+  }, [completeOnboarding, refreshStatusAndMaybeConnect])
+
+  // Always stop polling when the component unmounts.
+  useEffect(() => stopStatusPolling, [stopStatusPolling])
 
   useLayoutEffect(() => {
     const el = ppBtnMeasureRef.current
@@ -326,10 +534,17 @@ export default function PayPalConnectionPage() {
     }
   }, [connState, env, finalUrl])
 
+  // Only block the click while we are not ready; when ready, let the native click
+  // through so partner.js can open the mini-browser. Start polling status so we
+  // detect completion (and close the popup) even if no completion message reaches
+  // this page.
   const handleConnectClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
     if (connState !== "ready" || !finalUrl || onboardingInProgress) {
       e.preventDefault()
+      return
     }
+    completedRef.current = false
+    startStatusPolling()
   }
 
   const handleSaveManual = async () => {
@@ -365,9 +580,7 @@ export default function PayPalConnectionPage() {
       setStatusInfo(refreshedStatus || null)
       setShowManual(false)
 
-      try {
-        localStorage.removeItem(CACHE_KEY)
-      } catch {}
+      clearCachedUrl(env)
     } catch (e: any) {
       console.error(e)
       setConnState("error")
@@ -381,6 +594,7 @@ export default function PayPalConnectionPage() {
     if (onboardingInProgress) return
     if (!window.confirm("Disconnect PayPal for this environment?")) return
 
+    stopStatusPolling()
     setOnboardingInProgress(true)
     setConnState("loading")
     setError(null)
@@ -401,14 +615,11 @@ export default function PayPalConnectionPage() {
         throw new Error(t || `Disconnect failed (${res.status})`)
       }
 
-      try {
-        localStorage.removeItem(CACHE_KEY)
-
-      } catch {}
+      clearCachedUrl(env)
+      completedRef.current = false
 
       currentRunId.current = ++runIdRef.current
-      const runId = currentRunId.current
-      fetchFreshLink(runId)
+      await fetchFreshLink(env, currentRunId.current)
     } catch (e: any) {
       console.error(e)
       setConnState("error")
@@ -419,12 +630,16 @@ export default function PayPalConnectionPage() {
   }
 
   const handleEnvChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const next = e.target.value as "sandbox" | "live"
-    setEnv(next)
-    cachedUrl = null
+    const next = e.target.value as Env
+    if (next === env || onboardingInProgress) return
+
+    stopStatusPolling()
+    completedRef.current = false
+    clearCachedUrl()
+    setConnState("loading")
 
     try {
-      await fetch("/admin/paypal/environment", {
+      await fetch(ENVIRONMENT_ENDPOINT, {
         method: "POST",
         headers: { "content-type": "application/json" },
         credentials: "include",
@@ -432,9 +647,7 @@ export default function PayPalConnectionPage() {
       })
     } catch {}
 
-    try {
-      localStorage.removeItem(CACHE_KEY)
-    } catch {}
+    setEnv(next)
   }
 
   return (
@@ -473,7 +686,6 @@ export default function PayPalConnectionPage() {
                   <div className="text-sm text-green-600 bg-green-50 p-3 rounded border border-green-200">
                     ✅ Successfully connected to PayPal!
                     <a
-                      target="_blank"
                       data-paypal-button="true"
                       data-paypal-onboard-complete="onboardingCallback"
                       href="#"
@@ -528,7 +740,6 @@ export default function PayPalConnectionPage() {
                         ppBtnMeasureRef.current = node
                       }}
                       id="paypal-button"
-                      target="_blank"
                       data-paypal-button="true"
                       href={finalUrl || "#"}
                       data-paypal-onboard-complete="onboardingCallback"

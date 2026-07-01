@@ -1,6 +1,6 @@
 {
   "name": "@easypayment/medusa-payment-paypal",
-  "version": "0.9.17",
+  "version": "0.9.29",
   "description": "PayPal integration for Medusa v2",
   "author": "EasyPayment Plugins",
   "license": "MIT",
@@ -75,14 +75,7 @@
     "url": "https://github.com/easypaymentplugins/medusa-paypal.git"
   },
   "keywords": [
-    "medusa",
     "medusa-v2",
-    "medusa-plugin",
-    "medusa-plugin-integration",
-    "medusa-plugin-payment",
-    "medusa-paypal-payment",
-    "medusa-paypal-plugin",
-    "medusa-paypal-integration",
-    "medusa-paypal"
+    "medusa-plugin-integration"
   ]
 }

@@ -1,5 +1,5 @@
-import { createPaymentSessionsWorkflow } from "@medusajs/core-flows"
 import { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { runCoreWorkflow } from "../../../../../modules/paypal/utils/core-workflow"
 
 type CreatePaymentSessionBody = {
   provider_id: string
@@ -25,13 +25,11 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   }
 
   try {
-    const { result } = await createPaymentSessionsWorkflow(req.scope).run({
-      input: {
-        payment_collection_id: collectionId,
-        provider_id,
-        customer_id,
-        data,
-      },
+    const { result } = await runCoreWorkflow(req.scope, "create-payment-sessions", {
+      payment_collection_id: collectionId,
+      provider_id,
+      customer_id,
+      data,
     })
 
     res.status(200).json({ payment_session: result })

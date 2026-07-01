@@ -8,6 +8,11 @@ import {
   normalizeEventVersion,
   processPayPalWebhookEvent,
 } from "../../../../modules/paypal/webhook-processor"
+import {
+  composeVerifyRequestBody,
+  rawBodyToString,
+  resolveWebhookEventJson,
+} from "../../../../modules/paypal/utils/webhook-verify"
 
 const REPLAY_WINDOW_MINUTES = (() => {
   const v = Number(process.env.PAYPAL_WEBHOOK_REPLAY_WINDOW_MINUTES)
@@ -110,7 +115,8 @@ async function verifyWebhookSignature(
   paypal: PayPalModuleService,
   environment: string,
   body: Record<string, unknown>,
-  headers: Record<string, string | string[] | undefined>
+  headers: Record<string, string | string[] | undefined>,
+  rawBody: string | null
 ): Promise<void> {
   const settings = await paypal.getSettings().catch(() => ({ data: {} }))
   const webhookId = resolveWebhookId(
@@ -131,17 +137,16 @@ async function verifyWebhookSignature(
 
   const accessToken = await paypal.getAppAccessToken()
 
-  const verifyPayload = {
+  const verifyFields = {
     auth_algo: getHeader(headers, "paypal-auth-algo"),
     cert_url: getHeader(headers, "paypal-cert-url"),
     transmission_id: getHeader(headers, "paypal-transmission-id"),
     transmission_sig: getHeader(headers, "paypal-transmission-sig"),
     transmission_time: getHeader(headers, "paypal-transmission-time"),
     webhook_id: webhookId,
-    webhook_event: body,
   }
 
-  const certUrl = verifyPayload.cert_url
+  const certUrl = verifyFields.cert_url
   if (
     certUrl &&
     !certUrl.startsWith("https://www.paypal.com/") &&
@@ -151,13 +156,21 @@ async function verifyWebhookSignature(
     throw new Error("Invalid paypal-cert-url: must originate from paypal.com")
   }
 
-  const missing = Object.entries(verifyPayload)
-    .filter(([k, v]) => k !== "webhook_id" && k !== "webhook_event" && !v)
+  const missing = Object.entries(verifyFields)
+    .filter(([k, v]) => k !== "webhook_id" && !v)
     .map(([k]) => k)
 
   if (missing.length > 0) {
     throw new Error(`Missing required PayPal webhook headers: ${missing.join(", ")}`)
   }
+
+  // Use the raw bytes PayPal signed for `webhook_event` whenever available
+  // (preserved by the route's `bodyParser: { preserveRawBody: true }`); fall
+  // back to serializing the parsed body so verification still runs if it isn't.
+  const requestBody = composeVerifyRequestBody(
+    verifyFields,
+    resolveWebhookEventJson(rawBody, body)
+  )
 
   const resp = await paypalFetch(`${base}/v1/notifications/verify-webhook-signature`, {
     method: "POST",
@@ -165,7 +178,7 @@ async function verifyWebhookSignature(
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(verifyPayload),
+    body: requestBody,
   })
 
   const json = await resp.json().catch(() => ({}))
@@ -214,7 +227,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
   try {
     const creds = await paypal.getActiveCredentials()
-    await verifyWebhookSignature(paypal, creds.environment, payload, req.headers)
+    const rawBody = rawBodyToString((req as unknown as { rawBody?: unknown }).rawBody)
+    await verifyWebhookSignature(paypal, creds.environment, payload, req.headers, rawBody)
   } catch (e: any) {
     console.error("[PayPal] webhook: signature verification failed:", e?.message)
     return res

@@ -1,6 +1,6 @@
-import { createPaymentSessionsWorkflow } from "@medusajs/core-flows"
 import { MedusaResponse, MedusaStoreRequest, refetchEntity } from "@medusajs/framework/http"
 import { MedusaError } from "@medusajs/framework/utils"
+import { runCoreWorkflow } from "../../../../../modules/paypal/utils/core-workflow"
 
 type CreatePaymentSessionBody = {
   provider_id: string
@@ -27,13 +27,11 @@ export async function POST(req: MedusaStoreRequest, res: MedusaResponse) {
   }
 
   try {
-    await createPaymentSessionsWorkflow(req.scope).run({
-      input: {
-        payment_collection_id: collectionId,
-        provider_id,
-        customer_id: req.auth_context?.actor_id,
-        data,
-      },
+    await runCoreWorkflow(req.scope, "create-payment-sessions", {
+      payment_collection_id: collectionId,
+      provider_id,
+      customer_id: req.auth_context?.actor_id,
+      data,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

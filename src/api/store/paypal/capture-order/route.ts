@@ -5,6 +5,7 @@ import { randomUUID } from "crypto"
 import type PayPalModuleService from "../../../../modules/paypal/service"
 import { getPayPalApiBase } from "../../../../modules/paypal/utils/paypal-auth"
 import { paypalFetch } from "../../../../modules/paypal/utils/paypal-fetch"
+import { extractCaptureStatus } from "../../../../modules/paypal/payment-provider/status-utils"
 import {
   findPayPalSessionForCart,
   getStoredPayPalOrderId,
@@ -204,6 +205,20 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     if (paymentAction === "authorize") {
       await attachPayPalAuthorizationToSession(cartId, orderId, payload, req.scope)
     } else {
+      // A 2xx capture response does NOT guarantee the funds settled: PayPal
+      // returns 201 for PENDING (pending review / eCheck), DECLINED and FAILED
+      // captures too. Returning those to the storefront as a successful capture
+      // would let it finalize the cart for a payment that never completed, so
+      // only a COMPLETED capture is reported as success — the webhook will
+      // reconcile a later PENDING→COMPLETED transition.
+      const captureStatus = extractCaptureStatus(payload)
+      if (captureStatus !== "COMPLETED") {
+        throw new Error(
+          `PayPal capture did not complete (status=${captureStatus || "UNKNOWN"})${
+            debugId ? ` debug_id=${debugId}` : ""
+          }`
+        )
+      }
       await attachPayPalCaptureToSession(cartId, orderId, payload, req.scope)
     }
 

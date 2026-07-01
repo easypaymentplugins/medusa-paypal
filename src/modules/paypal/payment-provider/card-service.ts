@@ -1,4 +1,4 @@
-import { AbstractPaymentProvider } from "@medusajs/framework/utils"
+import { AbstractPaymentProvider, MedusaError } from "@medusajs/framework/utils"
 import { randomUUID } from "crypto"
 import type {
   AuthorizePaymentInput,
@@ -25,12 +25,18 @@ import type {
   WebhookActionResult,
 } from "@medusajs/framework/types"
 import { getPayPalWebhookActionAndData } from "./webhook-utils"
-import { formatAmountForPayPal } from "../utils/amounts"
+import { formatAmountForPayPal, toAmountNumber } from "../utils/amounts"
 import { paypalFetch } from "../utils/paypal-fetch"
 import {
   assertPayPalCurrencySupported,
   normalizeCurrencyCode,
 } from "../utils/currencies"
+import {
+  extractCaptureStatus,
+  isCaptureCompleted,
+  isRefundFailureStatus,
+  mapPayPalCaptureStatus,
+} from "./status-utils"
 import type PayPalModuleService from "../service"
 
 type Options = {}
@@ -154,23 +160,12 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
   }
 
   private mapCaptureStatus(status?: string) {
-    const normalized = String(status || "").toUpperCase()
-    if (!normalized) {
-      return null
-    }
-    if (normalized === "COMPLETED") {
-      return "captured"
-    }
-    if (normalized === "PENDING") {
-      return "pending"
-    }
-    if (["DENIED", "DECLINED", "FAILED"].includes(normalized)) {
-      return "error"
-    }
-    if (["REFUNDED", "PARTIALLY_REFUNDED", "REVERSED"].includes(normalized)) {
-      return "canceled"
-    }
-    return null
+    // Delegate to the shared, unit-tested mapping so the card provider agrees
+    // with the wallet provider and the webhook processor. In particular a
+    // PARTIALLY_REFUNDED capture must stay "captured" (only part of the funds
+    // were returned) — mapping it to "canceled" would wrongly unwind a live
+    // capture.
+    return mapPayPalCaptureStatus(status)
   }
 
   private mapAuthorizationStatus(status?: string) {
@@ -478,7 +473,7 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
     const { accessToken, base } = await this.getPayPalAccessToken()
     const order = await this.getOrderDetails(orderId).catch(() => null)
     const existingCapture = order?.purchase_units?.[0]?.payments?.captures?.[0]
-    if (existingCapture?.id) {
+    if (existingCapture?.id && isCaptureCompleted(existingCapture)) {
       return {
         data: {
           ...(data || {}),
@@ -524,26 +519,38 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
       data.is_final_capture ??
       data.final_capture ??
       undefined
-    const capturePayload =
-      amount > 0
-        ? {
-            amount: {
-              currency_code: currencyCode || "EUR",
-              value: formatAmountForPayPal(amount, currencyCode || "EUR"),
-            },
-            ...(typeof isFinalCapture === "boolean"
-              ? { is_final_capture: isFinalCapture }
-              : {}),
-          }
-        : {
-            ...(typeof isFinalCapture === "boolean"
-              ? { is_final_capture: isFinalCapture }
-              : {}),
-          }
+    const captureValue = amount > 0
+      ? formatAmountForPayPal(amount, currencyCode || "EUR")
+      : null
 
-    const captureUrl = authorizationId
-      ? `${base}/v2/payments/authorizations/${encodeURIComponent(authorizationId)}/capture`
-      : `${base}/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`
+    // `amount` and `is_final_capture` are only honored on the authorizations
+    // capture endpoint. The orders capture endpoint always captures the FULL
+    // order and silently ignores an `amount` body — so a partial amount there
+    // would over-capture while we record the smaller requested value. Route
+    // partial captures through the authorization, and fail closed if a partial
+    // capture is attempted against a capture-intent order.
+    let capturePayload: Record<string, unknown>
+    let captureUrl: string
+    if (authorizationId) {
+      captureUrl = `${base}/v2/payments/authorizations/${encodeURIComponent(authorizationId)}/capture`
+      capturePayload = {
+        ...(captureValue
+          ? { amount: { currency_code: currencyCode || "EUR", value: captureValue } }
+          : {}),
+        ...(typeof isFinalCapture === "boolean" ? { is_final_capture: isFinalCapture } : {}),
+      }
+    } else {
+      captureUrl = `${base}/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`
+      capturePayload = {}
+      const orderTotal = order?.purchase_units?.[0]?.amount?.value
+      if (captureValue && orderTotal && captureValue !== String(orderTotal)) {
+        throw new Error(
+          `PayPal partial capture (${captureValue} ${currencyCode || "EUR"}) is not supported for ` +
+            `capture-intent orders (order total ${orderTotal}). Create the order with intent ` +
+            `AUTHORIZE to capture a partial amount.`
+        )
+      }
+    }
 
     const ppResp = await paypalFetch(captureUrl, {
       method: "POST",
@@ -567,6 +574,19 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
     }
 
     const capture = JSON.parse(ppText)
+
+    // A 2xx response does NOT mean the funds were captured. PayPal returns 201
+    // for captures that are PENDING (pending review / eCheck), DECLINED, or
+    // FAILED. Recording any of these as "captured" books money that never
+    // settled, so only a COMPLETED capture is treated as success.
+    const captureStatus = extractCaptureStatus(capture)
+    if (captureStatus !== "COMPLETED") {
+      throw new Error(
+        `PayPal capture did not complete (status=${captureStatus || "UNKNOWN"}). ` +
+          `The payment was not captured.${debugId ? ` debug_id=${debugId}` : ""}`
+      )
+    }
+
     const captureId =
       capture?.id || capture?.purchase_units?.[0]?.payments?.captures?.[0]?.id
     const existingCaptures = Array.isArray(paypalData.captures) ? paypalData.captures : []
@@ -707,70 +727,104 @@ class PayPalAdvancedCardProvider extends AbstractPaymentProvider<Options> {
     const paypalData = (data.paypal || {}) as Record<string, any>
     const captureId = String(paypalData.capture_id || data.capture_id || "")
     if (!captureId) {
-      throw new Error("PayPal capture_id is required to refund payment. No capture found in session data.")
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "PayPal capture_id is required to refund payment. No capture found in session data."
+      )
     }
 
-    const requestId = this.getIdempotencyKey(_input, `refund-${captureId}`)
     // Use the refund amount Medusa passes (top-level input), not the session
     // amount in `data` — otherwise a partial refund would refund the full order.
-    const amount = Number(_input.amount ?? 0)
+    // Medusa passes it as a BigNumberInput, so coerce it to a number; a naive
+    // Number() of the object form yields NaN and silently refunds the full
+    // capture.
+    const amount = toAmountNumber(_input.amount)
+    const requestId = this.getIdempotencyKey(_input, `refund-${captureId}-${amount}`)
     const currencyOverride = await this.resolveCurrencyOverride()
     const currencyCode = normalizeCurrencyCode(
       data.currency_code || currencyOverride || "EUR"
     )
-    const { accessToken, base } = await this.getPayPalAccessToken()
-    const refundPayload: Record<string, any> =
-      amount > 0
-        ? {
-            amount: {
-              currency_code: currencyCode,
-              value: formatAmountForPayPal(amount, currencyCode),
-            },
-          }
-        : {}
 
-    const resp = await paypalFetch(`${base}/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "PayPal-Request-Id": requestId,
-        "PayPal-Partner-Attribution-Id": BN_CODE,
-      },
-      body: JSON.stringify(refundPayload),
-    })
+    try {
+      const { accessToken, base } = await this.getPayPalAccessToken()
+      const refundPayload: Record<string, any> =
+        amount > 0
+          ? {
+              amount: {
+                currency_code: currencyCode,
+                value: formatAmountForPayPal(amount, currencyCode),
+              },
+            }
+          : {}
 
-    const text = await resp.text()
-    if (!resp.ok) {
-      const debugId = resp.headers.get("paypal-debug-id")
-      throw new Error(
-        `PayPal refund error (${resp.status}): ${text}${
-          debugId ? ` debug_id=${debugId}` : ""
-        }`
-      )
-    }
-
-    const refund = JSON.parse(text)
-    const existingRefunds = Array.isArray(paypalData.refunds) ? paypalData.refunds : []
-    const refundEntry = {
-      id: refund?.id,
-      status: refund?.status,
-      amount: refund?.amount,
-      raw: refund,
-    }
-
-    return {
-      data: {
-        ...(data || {}),
-        paypal: {
-          ...paypalData,
-          refund_id: refund?.id,
-          refund_status: refund?.status,
-          refunds: [...existingRefunds, refundEntry],
-          refund,
+      const resp = await paypalFetch(`${base}/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "PayPal-Request-Id": requestId,
+          "PayPal-Partner-Attribution-Id": BN_CODE,
         },
-        refunded_at: new Date().toISOString(),
-      },
+        body: JSON.stringify(refundPayload),
+      })
+
+      const text = await resp.text()
+      if (!resp.ok) {
+        const debugId = resp.headers.get("paypal-debug-id")
+        throw new MedusaError(
+          MedusaError.Types.UNEXPECTED_STATE,
+          `PayPal refund error (${resp.status}): ${text}${
+            debugId ? ` debug_id=${debugId}` : ""
+          }`
+        )
+      }
+
+      const refund = JSON.parse(text)
+
+      // As with captures, a 2xx response does not guarantee the refund stuck.
+      // FAILED / CANCELLED / DENIED refunds also return 2xx and must not be
+      // recorded as a successful refund. PENDING is accepted: PayPal processes
+      // refunds asynchronously and a pending refund will settle.
+      const refundStatus = String(refund?.status || "").toUpperCase()
+      if (isRefundFailureStatus(refundStatus)) {
+        const refundDebugId = resp.headers.get("paypal-debug-id")
+        throw new MedusaError(
+          MedusaError.Types.UNEXPECTED_STATE,
+          `PayPal refund did not succeed (status=${refundStatus}). The refund was not issued.` +
+            (refundDebugId ? ` debug_id=${refundDebugId}` : "")
+        )
+      }
+
+      const existingRefunds = Array.isArray(paypalData.refunds) ? paypalData.refunds : []
+      const refundEntry = {
+        id: refund?.id,
+        status: refund?.status,
+        amount: refund?.amount,
+        raw: refund,
+      }
+
+      return {
+        data: {
+          ...(data || {}),
+          paypal: {
+            ...paypalData,
+            refund_id: refund?.id,
+            refund_status: refund?.status,
+            refunds: [...existingRefunds, refundEntry],
+            refund,
+          },
+          refunded_at: new Date().toISOString(),
+        },
+      }
+    } catch (error: any) {
+      // Surface the real reason: Medusa masks any non-MedusaError as a generic
+      // "An unknown error occurred." in production, hiding the PayPal failure.
+      throw error instanceof MedusaError
+        ? error
+        : new MedusaError(
+            MedusaError.Types.UNEXPECTED_STATE,
+            error?.message || "PayPal refund failed."
+          )
     }
   }
 

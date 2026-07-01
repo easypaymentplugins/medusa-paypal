@@ -493,10 +493,22 @@ class PayPalModuleService extends MedusaService({
     return await this.getCurrentRow()
   }
 
-  async createOnboardingLink(input?: { email?: string; products?: string[] }) {
+  async createOnboardingLink(input?: { email?: string; products?: string[]; env?: Environment }) {
     const { onboarding } = await this.ensureSettingsDefaults()
-    const return_url = `${String(onboarding.backend_url || "").replace(/\/$/, "")}/admin/paypal/onboard-complete`
-    const env = await this.getCurrentEnvironment()
+    // Honor an explicit environment from the caller so the generated link can't
+    // depend on a racing "set environment" request having landed first.
+    const env =
+      input?.env === "sandbox" || input?.env === "live"
+        ? input.env
+        : await this.getCurrentEnvironment()
+    // The popup lands here after onboarding, as a plain top-level navigation with
+    // no auth token — so it must be the PUBLIC store bridge route, not an
+    // /admin/* route (which would 401 and leave the popup stuck). The bridge
+    // exchanges the auth code for seller credentials server-side, relays the
+    // result to the opener, and closes the popup. We pin the environment in the
+    // URL so the bridge saves credentials under the correct env even though
+    // PayPal's redirect carries no auth/session.
+    const return_url = `${String(onboarding.backend_url || "").replace(/\/$/, "")}/store/paypal/onboard-return?env=${env}`
     const partner_merchant_id = await this.getPartnerMerchantId(env)
 
     const email = (input?.email || "").trim()
@@ -644,9 +656,23 @@ class PayPalModuleService extends MedusaService({
     sharedId: string
     env?: "sandbox" | "live"
   }) {
-    await this.saveOnboardCallback({ authCode: input.authCode, sharedId: input.sharedId })
-
     const env = (input.env || (await this.getCurrentEnvironment())) as Environment
+
+    // Onboarding completion can now arrive via several redundant paths
+    // (partner.js's onboardingCallback in the opener, the return_url bridge that
+    // runs inside the popup, and admin status polling). PayPal's authorization
+    // code is single-use, so a second exchange of the same code would fail with
+    // invalid_grant. If we already exchanged this exact code and hold seller
+    // credentials for this environment, treat the duplicate as a success no-op.
+    const existingRow = await this.getCurrentRow()
+    if (existingRow && existingRow.auth_code === input.authCode) {
+      const existingCreds = this.getEnvCreds(existingRow, env)
+      if (existingCreds.clientId && existingCreds.clientSecret) {
+        return
+      }
+    }
+
+    await this.saveOnboardCallback({ authCode: input.authCode, sharedId: input.sharedId })
     const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
 
     const { onboarding } = await this.ensureSettingsDefaults()
@@ -681,6 +707,16 @@ class PayPalModuleService extends MedusaService({
     }
 
     if (!tokenRes.ok) {
+      // Two redundant completion paths can race to exchange the same single-use
+      // code; the loser gets invalid_grant. If credentials were saved in the
+      // meantime (the other path won), the onboarding actually succeeded.
+      const racedRow = await this.getCurrentRow()
+      if (racedRow) {
+        const racedCreds = this.getEnvCreds(racedRow, env)
+        if (racedCreds.clientId && racedCreds.clientSecret) {
+          return
+        }
+      }
       throw new Error(
         `PayPal authorization_code token exchange failed (${tokenRes.status}): ${tokenText || JSON.stringify(tokenJson)}`
       )
@@ -899,7 +935,9 @@ class PayPalModuleService extends MedusaService({
       console.warn("[PayPal] saveAndHydrateSellerCredentials lookup failed:", e?.message || e)
     }
 
-    return await this.getStatus(env)
+    // This is a write context (credentials were just saved), so it is allowed to
+    // backfill the seller profile if it is still missing.
+    return await this.getStatus(env, { hydrateMissingProfile: true })
   }
 
   private async resolveWebhookUrl() {
@@ -1028,7 +1066,19 @@ class PayPalModuleService extends MedusaService({
     )}`
   }
 
-  async getStatus(envOverride?: Environment) {
+  /**
+   * Report the current connection status.
+   *
+   * `hydrateMissingProfile` is opt-in and OFF by default: status is read on
+   * `GET /admin/paypal/status` (and other read-only routes), where it must be a
+   * safe, side-effect-free read. The seller-profile backfill makes an outbound
+   * PayPal call and persists to the DB, so it only runs from write contexts
+   * (e.g. saving credentials) that explicitly request it.
+   */
+  async getStatus(
+    envOverride?: Environment,
+    opts: { hydrateMissingProfile?: boolean } = {}
+  ) {
     const row = await this.getCurrentRow()
     const env = envOverride ?? (await this.getCurrentEnvironment())
 
@@ -1041,7 +1091,7 @@ class PayPalModuleService extends MedusaService({
     let sellerEmail: string | null = c.sellerEmail || row.seller_email || null
     let sellerMerchantId: string | null = c.sellerMerchantId || row.seller_merchant_id || null
 
-    if (!sellerEmail && hasCreds) {
+    if (!sellerEmail && hasCreds && opts.hydrateMissingProfile) {
       try {
         const hydrated = await this.fetchSellerProfileFromDirectCredentials(env)
         if (hydrated.sellerEmail || hydrated.sellerMerchantId) {
