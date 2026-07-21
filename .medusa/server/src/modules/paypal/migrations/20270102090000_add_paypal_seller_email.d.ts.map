@@ -1,0 +1,1 @@
+{"version":3,"file":"20270102090000_add_paypal_seller_email.d.ts","sourceRoot":"","sources":["../../../../../../src/modules/paypal/migrations/20270102090000_add_paypal_seller_email.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,SAAS,EAAE,MAAM,0CAA0C,CAAA;AAEpE,qBAAa,uBAAwB,SAAQ,SAAS;IACrC,EAAE,IAAI,OAAO,CAAC,IAAI,CAAC;IAInB,IAAI,IAAI,OAAO,CAAC,IAAI,CAAC;CAGrC"}

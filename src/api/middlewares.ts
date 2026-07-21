@@ -1,4 +1,5 @@
 import { defineMiddlewares } from "@medusajs/framework/http"
+import { createRateLimiter } from "./utils/rate-limit"
 
 export default defineMiddlewares({
   routes: [
@@ -12,8 +13,31 @@ export default defineMiddlewares({
       middlewares: [],
     },
     {
-      matcher: "/store/paypal-complete",
+      // Same raw-body requirement for the /hooks mirror of the webhook route —
+      // the path external PayPal deliveries actually reach, since Medusa's
+      // publishable-key middleware blocks unauthenticated POSTs to /store/*.
+      matcher: "/hooks/paypal/webhook",
+      method: ["POST"],
+      bodyParser: { preserveRawBody: true },
       middlewares: [],
+    },
+    {
+      // Rate-limit the order-creating route: unauthenticated by necessity, so
+      // cap how fast one client can spin up PayPal orders on the merchant
+      // account. Each createRateLimiter() call builds its own counter at boot.
+      matcher: "/store/paypal/create-order",
+      method: ["POST"],
+      middlewares: [createRateLimiter("create-order")],
+    },
+    {
+      matcher: "/store/paypal/capture-order",
+      method: ["POST"],
+      middlewares: [createRateLimiter("capture-order")],
+    },
+    {
+      matcher: "/store/paypal-complete",
+      method: ["POST"],
+      middlewares: [createRateLimiter("paypal-complete")],
     },
     {
       matcher: "/store/paypal/:path*",

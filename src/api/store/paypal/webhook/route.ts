@@ -1,13 +1,13 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { Modules } from "@medusajs/framework/utils"
+import type { IEventBusModuleService } from "@medusajs/framework/types"
 import type PayPalModuleService from "../../../../modules/paypal/service"
 import { paypalFetch } from "../../../../modules/paypal/utils/paypal-fetch"
 import {
-  computeNextRetryAt,
   isAllowedEventType,
-  isRetryableError,
   normalizeEventVersion,
-  processPayPalWebhookEvent,
 } from "../../../../modules/paypal/webhook-processor"
+import { PAYPAL_WEBHOOK_RECEIVED_EVENT } from "../../../../subscribers/paypal-webhook-process"
 import {
   composeVerifyRequestBody,
   rawBodyToString,
@@ -212,7 +212,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
 
   if (transmissionId) {
     try {
-      const existing = await paypal.listPayPalWebhookEvents({ transmission_id: transmissionId })
+      const existing = await paypal.listPayPalWebhookEvents({ transmission_id: transmissionId }, { take: 1 })
       if ((existing || []).length > 0) {
         console.info("[PayPal] webhook: duplicate transmission_id", {
           transmissionId,
@@ -280,71 +280,35 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     return res.json({ ok: true, ignored: true })
   }
 
+  // Process the verified, persisted event asynchronously: emit an event and
+  // return 200 immediately so PayPal's ~15s webhook delivery timeout is never
+  // tripped by slow downstream work (the audit's synchronous-processing
+  // bottleneck). The `paypal-webhook-process` subscriber does the actual work
+  // off the request path; if the event bus drops the message, the webhook retry
+  // cron recovers events left in "processing" past a staleness threshold, so the
+  // event is never lost. The record is already persisted as "processing" above.
   try {
-    const processed = await processPayPalWebhookEvent(req.scope, { eventType, payload })
-
-    if (recordId) {
-      await paypal
-        .updateWebhookEventRecord({
-          id: recordId,
-          status: "processed",
-          processed_at: new Date(),
-          resource_id:
-            processed.refundId || processed.captureId || processed.orderId || null,
-        })
-        .catch(() => {})
-    }
-
-    console.info("[PayPal] webhook: processed", {
-      event_id: eventId,
-      event_type: eventType,
-      order_id: processed.orderId,
-      capture_id: processed.captureId,
-      refund_id: processed.refundId,
-      cart_id: processed.cartId,
-      session_updated: processed.sessionUpdated,
+    const eventBus = req.scope.resolve<IEventBusModuleService>(Modules.EVENT_BUS)
+    await eventBus.emit({
+      name: PAYPAL_WEBHOOK_RECEIVED_EVENT,
+      data: { id: recordId },
     })
-
-    await paypal.recordMetric("webhook_success").catch(() => {})
-    return res.json({ ok: true })
-  } catch (e: any) {
-    console.error("[PayPal] webhook: processing failed", {
+    console.info("[PayPal] webhook: accepted for async processing", {
       event_id: eventId,
       event_type: eventType,
+      record_id: recordId,
+    })
+  } catch (e: any) {
+    // The event was persisted as "processing"; the retry cron's stale-processing
+    // recovery will pick it up even though the emit failed. Ack PayPal anyway so
+    // it doesn't re-deliver (which would just dedupe).
+    console.error("[PayPal] webhook: failed to enqueue async processing (retry cron will recover)", {
+      event_id: eventId,
+      event_type: eventType,
+      record_id: recordId,
       error: e?.message,
     })
-
-    const retryable = isRetryableError(e)
-    const nextStatus = retryable ? "failed" : "dead_letter"
-
-    if (recordId) {
-      await paypal
-        .updateWebhookEventRecord({
-          id: recordId,
-          status: nextStatus,
-          attempt_count: 1,
-          next_retry_at: retryable ? computeNextRetryAt(1) : null,
-          last_error: e?.message || String(e),
-        })
-        .catch(() => {})
-    }
-
-    await paypal
-      .recordAuditEvent("webhook_processing_failed", {
-        event_id: eventId,
-        event_type: eventType,
-        retryable,
-        message: e?.message || String(e),
-      })
-      .catch(() => {})
-
-    await paypal.recordMetric("webhook_failed").catch(() => {})
-
-    if (!retryable) {
-      return res.status(200).json({ ok: false, message: "Webhook processing failed" })
-    }
-    return res
-      .status(500)
-      .json({ message: "PayPal webhook processing error" })
   }
+
+  return res.json({ ok: true, accepted: true })
 }

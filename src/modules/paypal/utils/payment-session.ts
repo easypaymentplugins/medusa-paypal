@@ -82,23 +82,57 @@ export function getStoredPayPalOrderId(
  * Shallow-merge `extraData` into a payment session's `data`, preserving the
  * session's amount/currency. Callers that update the nested `paypal` object are
  * responsible for spreading its existing keys (see `getStoredPayPalOrderId`).
+ *
+ * The write is retried a few times before giving up: when this runs right after
+ * a successful PayPal capture, a transient DB blip that loses the write means
+ * the money is captured but Medusa never records it. A bounded retry closes the
+ * common transient-failure window; if every attempt fails the error is
+ * re-thrown (with a CRITICAL log for capture/order data) so the caller can react
+ * — the webhook and paypal-complete's live re-derivation remain the backstop.
  */
+const SESSION_UPDATE_MAX_ATTEMPTS = 3
+const SESSION_UPDATE_BASE_DELAY_MS = 200
+
 export async function updatePayPalSessionData(
   sessionId: string,
   extraData: Record<string, any>,
   scope: any
 ): Promise<void> {
-  try {
-    const paymentModule = scope.resolve(Modules.PAYMENT) as IPaymentModuleService
-    const [existing] = await paymentModule.listPaymentSessions({ id: [sessionId] }, { take: 1 })
-    const mergedData = { ...(existing?.data || {}), ...extraData }
-    await (paymentModule as any).updatePaymentSession({
-      id: sessionId,
-      data: mergedData,
-      amount: existing?.amount,
-      currency_code: existing?.currency_code,
-    })
-  } catch (e: any) {
-    console.error("[PayPal] updatePayPalSessionData failed:", e?.message)
+  const paymentModule = scope.resolve(Modules.PAYMENT) as IPaymentModuleService
+  let lastError: unknown
+
+  for (let attempt = 1; attempt <= SESSION_UPDATE_MAX_ATTEMPTS; attempt++) {
+    try {
+      const [existing] = await paymentModule.listPaymentSessions({ id: [sessionId] }, { take: 1 })
+      const mergedData = { ...(existing?.data || {}), ...extraData }
+      await (paymentModule as any).updatePaymentSession({
+        id: sessionId,
+        data: mergedData,
+        amount: existing?.amount,
+        currency_code: existing?.currency_code,
+      })
+      return
+    } catch (e: unknown) {
+      lastError = e
+      const msg = e instanceof Error ? e.message : String(e)
+      console.warn(
+        `[PayPal] updatePayPalSessionData attempt ${attempt}/${SESSION_UPDATE_MAX_ATTEMPTS} failed:`,
+        msg
+      )
+      if (attempt < SESSION_UPDATE_MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, SESSION_UPDATE_BASE_DELAY_MS * attempt))
+      }
+    }
   }
+
+  const msg = lastError instanceof Error ? lastError.message : String(lastError)
+  console.error("[PayPal] updatePayPalSessionData failed after retries:", msg)
+  const hasCaptureData = "capture_id" in extraData || "order_id" in extraData
+  if (hasCaptureData) {
+    console.error(
+      "[PayPal] CRITICAL: Payment data (capture/order) was NOT persisted to session.",
+      { sessionId, keys: Object.keys(extraData) }
+    )
+  }
+  throw lastError
 }

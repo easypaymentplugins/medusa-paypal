@@ -11,7 +11,6 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   try {
     const creds = await paypal.getActiveCredentials()
     const apiDetails = await paypal.getApiDetails().catch(() => null)
-    const client_token = await paypal.generateClientToken({ locale: "en_US" }).catch(() => "")
     const cartId = (req.query?.cart_id as string) || ""
     const query = req.scope.resolve("query")
     let currency = normalizeCurrencyCode(
@@ -74,6 +73,14 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
         ? advancedCardSettings.threeDS
         : "when_required"
 
+    // The client_token grants the browser SDK API access and is only needed to
+    // render the Advanced (hosted) Card Fields. Generate/expose it only when
+    // card payments are enabled — the PayPal buttons flow uses just client_id —
+    // so an unauthenticated config fetch doesn't hand out a token it won't use.
+    const client_token = cardEnabled
+      ? await paypal.generateClientToken({ locale: "en_US" }).catch(() => "")
+      : ""
+
     return res.json({
       environment: creds.environment,
       client_id: creds.client_id,
@@ -93,6 +100,14 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       button_width: paypalSettings.buttonWidth || "responsive",
       button_height: paypalSettings.buttonHeight ?? 45,
       button_label: paypalSettings.buttonLabel || "paypal",
+      // Funding sources to disable in the PayPal JS SDK (e.g. ["card",
+      // "paylater"]). The UI package has always read this field; emit it so
+      // the setting actually takes effect.
+      disable_buttons: Array.isArray(paypalSettings.disableButtons)
+        ? paypalSettings.disableButtons.map((b: unknown) => String(b))
+        : Array.isArray(paypalSettings.disable_buttons)
+          ? paypalSettings.disable_buttons.map((b: unknown) => String(b))
+          : [],
     })
   } catch {
     return res.status(500).json({ message: "Failed to load PayPal config" })

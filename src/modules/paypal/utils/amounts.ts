@@ -50,11 +50,23 @@ export function toAmountNumber(amount: unknown): number {
     return 0
   }
   if (typeof amount === "number") {
-    return Number.isFinite(amount) ? amount : 0
+    if (!Number.isFinite(amount)) {
+      throw new Error(`Invalid payment amount: non-finite number (${amount})`)
+    }
+    return amount
   }
   if (typeof amount === "string") {
+    // `Number("")` and `Number("   ")` both coerce to 0 — treat a blank string
+    // as invalid rather than let it silently become a zero amount (which would
+    // turn a partial refund/capture into a full one).
+    if (amount.trim() === "") {
+      throw new Error(`Invalid payment amount: unparseable string "${amount}"`)
+    }
     const parsed = Number(amount)
-    return Number.isFinite(parsed) ? parsed : 0
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`Invalid payment amount: unparseable string "${amount}"`)
+    }
+    return parsed
   }
   if (typeof amount === "object") {
     const obj = amount as Record<string, unknown>
@@ -64,12 +76,18 @@ export function toAmountNumber(amount: unknown): number {
     }
     // Serialized raw form: { value: "20", precision: 20 }.
     if (obj.value !== undefined && obj.value !== null) {
+      // Guard the blank-string-coerces-to-0 case here too (see string branch).
+      if (typeof obj.value === "string" && obj.value.trim() === "") {
+        throw new Error(`Invalid payment amount: unparseable BigNumber value "${obj.value}"`)
+      }
       const parsed = Number(obj.value)
-      return Number.isFinite(parsed) ? parsed : 0
+      if (!Number.isFinite(parsed)) {
+        throw new Error(`Invalid payment amount: unparseable BigNumber value "${obj.value}"`)
+      }
+      return parsed
     }
   }
-  const fallback = Number(amount as never)
-  return Number.isFinite(fallback) ? fallback : 0
+  throw new Error(`Invalid payment amount: unrecognized type (${typeof amount})`)
 }
 
 /**
@@ -81,6 +99,9 @@ export function toAmountNumber(amount: unknown): number {
  * for the currency — it must NOT divide/convert to minor units.
  */
 export function formatAmountForPayPal(amount: number, currencyCode: string) {
+  if (!Number.isFinite(amount)) {
+    throw new Error(`Invalid payment amount for PayPal formatting: ${amount}`)
+  }
   const exponent = getCurrencyExponent(currencyCode)
-  return Number(amount || 0).toFixed(exponent)
+  return amount.toFixed(exponent)
 }

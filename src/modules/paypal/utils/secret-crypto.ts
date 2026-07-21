@@ -36,6 +36,7 @@ const SALT_LEN = 16
 let cachedRaw: string | undefined
 let cachedRawKey: string | null = null
 let legacyV1Key: Buffer | null = null
+const V2_KEY_CACHE_MAX = 100
 const v2KeyCache = new Map<string, Buffer>()
 
 /**
@@ -70,6 +71,10 @@ function deriveV2Key(raw: string, salt: Buffer): Buffer {
       r: SCRYPT_R,
       p: SCRYPT_P,
     })
+    if (v2KeyCache.size >= V2_KEY_CACHE_MAX) {
+      const oldest = v2KeyCache.keys().next().value
+      if (oldest !== undefined) v2KeyCache.delete(oldest)
+    }
     v2KeyCache.set(cacheKey, key)
   }
   return key
@@ -96,6 +101,35 @@ export function isEncrypted(value: unknown): boolean {
   )
 }
 
+let warnedNoKey = false
+
+/**
+ * Surface (once) that secrets are being stored without encryption-at-rest. In a
+ * production environment this is a real exposure — client_secret / access_token
+ * land in the database as plaintext — so it is worth a loud warning. Set
+ * PAYPAL_ENCRYPTION_STRICT=true to make it a hard error instead (recommended for
+ * production once a key is provisioned), which fails the write rather than
+ * persisting a plaintext secret.
+ */
+function assertOrWarnNoEncryptionKey(): void {
+  const strict = String(process.env.PAYPAL_ENCRYPTION_STRICT || "").toLowerCase()
+  if (strict === "true" || strict === "1") {
+    throw new Error(
+      "PAYPAL_ENCRYPTION_STRICT is enabled but PAYPAL_ENCRYPTION_KEY is not set. " +
+        "Set PAYPAL_ENCRYPTION_KEY to encrypt PayPal secrets at rest, or disable strict mode."
+    )
+  }
+  if (!warnedNoKey) {
+    warnedNoKey = true
+    const inProd = process.env.NODE_ENV === "production"
+    console.warn(
+      `[PayPal]${inProd ? " WARNING (production):" : ""} PAYPAL_ENCRYPTION_KEY is not set — ` +
+        "PayPal secrets (client_secret, access_token) are stored UNENCRYPTED. " +
+        "Set PAYPAL_ENCRYPTION_KEY to enable AES-256-GCM encryption at rest."
+    )
+  }
+}
+
 /**
  * Encrypt a secret for storage. Returns the input unchanged when no key is
  * configured or when the value is empty/already encrypted. Always writes the
@@ -106,7 +140,13 @@ export function encryptSecret<T extends string | null | undefined>(value: T): T 
     return value
   }
   const raw = getRawKey()
-  if (!raw || isEncrypted(value)) {
+  if (!raw) {
+    if (!isEncrypted(value)) {
+      assertOrWarnNoEncryptionKey()
+    }
+    return value
+  }
+  if (isEncrypted(value)) {
     return value
   }
   const salt = randomBytes(SALT_LEN)

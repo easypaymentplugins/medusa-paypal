@@ -1,0 +1,228 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.POST = POST;
+const utils_1 = require("@medusajs/framework/utils");
+const crypto_1 = require("crypto");
+const paypal_auth_1 = require("../../../../modules/paypal/utils/paypal-auth");
+const paypal_fetch_1 = require("../../../../modules/paypal/utils/paypal-fetch");
+const status_utils_1 = require("../../../../modules/paypal/payment-provider/status-utils");
+const payment_session_1 = require("../../../../modules/paypal/utils/payment-session");
+const BN_CODE = "MBJTechnolabs_SI_SPB";
+const PAYPAL_ORDER_ID_RE = /^[A-Z0-9]{10,25}$/;
+function resolveIdempotencyKey(req, suffix, fallback) {
+    const header = req.headers["idempotency-key"] ||
+        req.headers["Idempotency-Key"] ||
+        req.headers["x-idempotency-key"] ||
+        req.headers["X-Idempotency-Key"];
+    const key = Array.isArray(header) ? header[0] : header;
+    if (key && String(key).trim()) {
+        return `${String(key).trim()}-${suffix}`;
+    }
+    return fallback || `pp-${suffix}-${(0, crypto_1.randomUUID)()}`;
+}
+/**
+ * Persist the capture onto the cart's PayPal session. Returns `true` when the
+ * data was written (or there was nothing to write because no session exists),
+ * and `false` when the write ultimately failed after retries. The caller must
+ * NOT silently treat a `false` here as success: the funds were captured at
+ * PayPal, so a persistence failure has to be recorded/alerted (the webhook and
+ * paypal-complete's live re-derivation are the reconciliation backstop).
+ */
+async function attachPayPalCaptureToSession(cartId, orderId, capture, scope) {
+    const session = await (0, payment_session_1.findPayPalSessionForCart)(cartId, scope);
+    if (!session) {
+        console.warn("[PayPal] attachPayPalCaptureToSession: no session found for cart", cartId);
+        return true;
+    }
+    const captureId = capture?.purchase_units?.[0]?.payments?.captures?.[0]?.id || capture?.id;
+    try {
+        await (0, payment_session_1.updatePayPalSessionData)(session.session_id, {
+            paypal: {
+                ...((session.session_data || {}).paypal || {}),
+                order_id: orderId,
+                capture_id: captureId,
+                capture,
+            },
+        }, scope);
+        return true;
+    }
+    catch (e) {
+        console.error("[PayPal] attachPayPalCaptureToSession failed:", e instanceof Error ? e.message : e);
+        return false;
+    }
+}
+async function attachPayPalAuthorizationToSession(cartId, orderId, authorization, scope) {
+    const session = await (0, payment_session_1.findPayPalSessionForCart)(cartId, scope);
+    if (!session) {
+        console.warn("[PayPal] attachPayPalAuthorizationToSession: no session found for cart", cartId);
+        return true;
+    }
+    const authorizationId = authorization?.purchase_units?.[0]?.payments?.authorizations?.[0]?.id;
+    try {
+        await (0, payment_session_1.updatePayPalSessionData)(session.session_id, {
+            paypal: {
+                ...((session.session_data || {}).paypal || {}),
+                order_id: orderId,
+                authorization_id: authorizationId,
+                authorization,
+            },
+        }, scope);
+        return true;
+    }
+    catch (e) {
+        console.error("[PayPal] attachPayPalAuthorizationToSession failed:", e instanceof Error ? e.message : e);
+        return false;
+    }
+}
+async function getExistingCapture(cartId, orderId, scope) {
+    try {
+        const session = await (0, payment_session_1.findPayPalSessionForCart)(cartId, scope);
+        if (!session)
+            return null;
+        const paypalData = (session.session_data || {}).paypal || {};
+        const existingOrderId = String(paypalData.order_id || "");
+        if (existingOrderId && existingOrderId !== orderId)
+            return null;
+        if (paypalData.capture)
+            return paypalData.capture;
+        if (paypalData.capture_id)
+            return { id: paypalData.capture_id };
+        return null;
+    }
+    catch {
+        return null;
+    }
+}
+async function POST(req, res) {
+    const paypal = req.scope.resolve("paypal_onboarding");
+    const logger = req.scope.resolve(utils_1.ContainerRegistrationKeys.LOGGER);
+    const requestId = (0, crypto_1.randomUUID)();
+    const { scope } = req;
+    let debugId = null;
+    try {
+        const body = (req.body || {});
+        const cartId = body.cart_id;
+        const orderId = body.order_id;
+        if (!cartId || !orderId) {
+            return res.status(400).json({ message: "cart_id and order_id are required" });
+        }
+        if (typeof cartId !== "string" || !cartId.startsWith("cart_")) {
+            return res.status(400).json({ message: "Invalid cart_id format" });
+        }
+        if (!PAYPAL_ORDER_ID_RE.test(orderId)) {
+            return res.status(400).json({ message: "Invalid order_id format" });
+        }
+        // Bind the capture to the cart's own PayPal session, fail-closed: the
+        // order_id MUST be the one this cart's session created (stored by
+        // create-order). This prevents capturing an arbitrary, caller-supplied
+        // order_id against the merchant account.
+        const session = await (0, payment_session_1.findPayPalSessionForCart)(cartId, scope);
+        const sessionOrderId = (0, payment_session_1.getStoredPayPalOrderId)(session?.session_data);
+        if (!session || !sessionOrderId) {
+            return res.status(409).json({
+                message: "No PayPal order is associated with this cart's payment session",
+            });
+        }
+        if (sessionOrderId !== orderId) {
+            return res.status(400).json({
+                message: "order_id does not match the payment session for this cart",
+            });
+        }
+        const existingCapture = await getExistingCapture(cartId, orderId, scope);
+        if (existingCapture) {
+            return res.json({ capture: existingCapture });
+        }
+        const creds = await paypal.getActiveCredentials();
+        // Cached app access token (single-flight refresh) — avoids an OAuth
+        // round-trip on every capture-order call.
+        const base = (0, paypal_auth_1.getPayPalApiBase)(creds.environment);
+        const accessToken = await paypal.getAppAccessToken();
+        const settings = await paypal.getSettings().catch(() => ({}));
+        const data = settings && typeof settings === "object" && "data" in settings
+            ? (settings.data ?? {})
+            : {};
+        const additionalSettings = (data.additional_settings || {});
+        const paymentAction = typeof additionalSettings.paymentAction === "string"
+            ? additionalSettings.paymentAction
+            : "capture";
+        const requestId = resolveIdempotencyKey(req, "capture-order", `pp-capture-${orderId}`);
+        const safeOrderId = encodeURIComponent(orderId);
+        const endpoint = paymentAction === "authorize"
+            ? `${base}/v2/checkout/orders/${safeOrderId}/authorize`
+            : `${base}/v2/checkout/orders/${safeOrderId}/capture`;
+        const ppResp = await (0, paypal_fetch_1.paypalFetch)(endpoint, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+                "Content-Type": "application/json",
+                "PayPal-Request-Id": requestId,
+                "PayPal-Partner-Attribution-Id": BN_CODE,
+            },
+        });
+        const ppText = await ppResp.text();
+        debugId = ppResp.headers.get("paypal-debug-id");
+        if (!ppResp.ok) {
+            throw new Error(`PayPal capture error (${ppResp.status}): ${ppText}${debugId ? ` debug_id=${debugId}` : ""}`);
+        }
+        const payload = JSON.parse(ppText);
+        let persisted = true;
+        if (paymentAction === "authorize") {
+            persisted = await attachPayPalAuthorizationToSession(cartId, orderId, payload, req.scope);
+        }
+        else {
+            // A 2xx capture response does NOT guarantee the funds settled: PayPal
+            // returns 201 for PENDING (pending review / eCheck), DECLINED and FAILED
+            // captures too. Returning those to the storefront as a successful capture
+            // would let it finalize the cart for a payment that never completed, so
+            // only a COMPLETED capture is reported as success — the webhook will
+            // reconcile a later PENDING→COMPLETED transition.
+            const captureStatus = (0, status_utils_1.extractCaptureStatus)(payload);
+            if (captureStatus !== "COMPLETED") {
+                throw new Error(`PayPal capture did not complete (status=${captureStatus || "UNKNOWN"})${debugId ? ` debug_id=${debugId}` : ""}`);
+            }
+            persisted = await attachPayPalCaptureToSession(cartId, orderId, payload, req.scope);
+        }
+        // The PayPal operation itself succeeded. If we could not persist it onto the
+        // Medusa session, the money is (authorized/)captured but Medusa doesn't yet
+        // record it — record a metric and log CRITICAL so it's observable/alertable.
+        // We still return success to the storefront: re-capturing would hit
+        // ORDER_ALREADY_CAPTURED, and both the webhook and paypal-complete's live
+        // PayPal re-derivation reconcile the session afterward.
+        if (!persisted) {
+            logger.error(`[paypal] CRITICAL: ${paymentAction === "authorize" ? "authorization" : "capture"} succeeded at PayPal but could not be persisted to the session (request_id=${requestId}, cart_id=${cartId}, order_id=${orderId})`);
+            try {
+                await paypal.recordMetric(paymentAction === "authorize"
+                    ? "authorize_order_persist_failed"
+                    : "capture_order_persist_failed");
+            }
+            catch {
+            }
+        }
+        try {
+            await paypal.recordMetric(paymentAction === "authorize" ? "authorize_order_success" : "capture_order_success");
+        }
+        catch {
+        }
+        return paymentAction === "authorize"
+            ? res.json({ authorization: payload })
+            : res.json({ capture: payload });
+    }
+    catch (e) {
+        const body = (req.body || {});
+        logger.error(`[paypal] capture-order failed (request_id=${requestId}, cart_id=${body.cart_id ?? "n/a"}, order_id=${body.order_id ?? "n/a"}, debug_id=${debugId ?? "n/a"}): ${e?.message ?? String(e)}`, e instanceof Error ? e : undefined);
+        try {
+            await paypal.recordAuditEvent("capture_order_failed", {
+                cart_id: body.cart_id,
+                order_id: body.order_id,
+                debug_id: debugId,
+                request_id: requestId,
+                message: e?.message || String(e),
+            });
+            await paypal.recordMetric("capture_order_failed");
+        }
+        catch {
+        }
+        return res.status(500).json({ message: "Failed to capture PayPal order", request_id: requestId });
+    }
+}
+//# sourceMappingURL=route.js.map

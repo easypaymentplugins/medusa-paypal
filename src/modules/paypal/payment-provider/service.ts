@@ -1,5 +1,4 @@
-import { AbstractPaymentProvider, MedusaError } from "@medusajs/framework/utils"
-import { randomUUID } from "crypto"
+import { MedusaError } from "@medusajs/framework/utils"
 import type {
   AuthorizePaymentInput,
   AuthorizePaymentOutput,
@@ -7,10 +6,6 @@ import type {
   CapturePaymentOutput,
   CancelPaymentInput,
   CancelPaymentOutput,
-  CreateAccountHolderInput,
-  CreateAccountHolderOutput,
-  DeletePaymentInput,
-  DeletePaymentOutput,
   GetPaymentStatusInput,
   GetPaymentStatusOutput,
   InitiatePaymentInput,
@@ -21,156 +16,26 @@ import type {
   RetrievePaymentOutput,
   UpdatePaymentInput,
   UpdatePaymentOutput,
-  ProviderWebhookPayload,
-  WebhookActionResult,
 } from "@medusajs/framework/types"
-import { formatAmountForPayPal, getCurrencyExponent, toAmountNumber } from "../utils/amounts"
+import { formatAmountForPayPal, toAmountNumber } from "../utils/amounts"
 import {
   assertPayPalCurrencySupported,
   normalizeCurrencyCode,
 } from "../utils/currencies"
-import type PayPalModuleService from "../service"
-import { getPayPalWebhookActionAndData } from "./webhook-utils"
-import { paypalFetch } from "../utils/paypal-fetch"
+import { PAYPAL_PARTNER_ATTRIBUTION_ID } from "../utils/partner"
+import { paypalFetch, paypalFetchWithRetry } from "../utils/paypal-fetch"
 import {
   extractCaptureStatus,
   isCaptureCompleted,
   isRefundFailureStatus,
-  mapPayPalCaptureStatus,
 } from "./status-utils"
+import { PayPalProviderBase } from "./base-provider"
 
-type Options = {}
-
-const BN_CODE = "MBJTechnolabs_SI_SPB"
-
-function generateSessionId() {
-  try {
-    return randomUUID()
-  } catch {
-    return `pp_${Date.now()}_${Math.random().toString(16).slice(2)}`
-  }
-}
-
-class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
+class PayPalPaymentProvider extends PayPalProviderBase {
   static identifier = "paypal"
 
-  protected readonly options_: Options
-
-  constructor(cradle: Record<string, any>, options: Options) {
-    super(cradle, options)
-    this.options_ = options
-  }
-
-  private resolvePayPalService() {
-    const container = this.container as {
-      resolve<T>(key: string): T
-    }
-    try {
-      return container.resolve<PayPalModuleService>("paypal_onboarding")
-    } catch {
-      return null
-    }
-  }
-
-  async resolveSettings() {
-    const paypal = this.resolvePayPalService()
-    if (!paypal) {
-      return {
-        additionalSettings: {} as Record<string, unknown>,
-        apiDetails: {} as Record<string, unknown>,
-      }
-    }
-    const settings = await paypal.getSettings().catch(() => ({}))
-    const data =
-      settings && typeof settings === "object" && "data" in settings
-        ? ((settings as { data?: Record<string, unknown> }).data ?? {})
-        : {}
-    return {
-      additionalSettings: (data.additional_settings || {}) as Record<string, unknown>,
-      apiDetails: (data.api_details || {}) as Record<string, unknown>,
-    }
-  }
-
-  private async resolveCurrencyOverride() {
-    const { apiDetails } = await this.resolveSettings()
-    if (typeof apiDetails.currency_code === "string" && (apiDetails.currency_code as string).trim()) {
-      return normalizeCurrencyCode(apiDetails.currency_code as string)
-    }
-    return normalizeCurrencyCode(process.env.PAYPAL_CURRENCY || "EUR")
-  }
-
-  private async getPayPalAccessToken() {
-    const paypal = this.resolvePayPalService()
-    if (!paypal) {
-      throw new Error(
-        "PayPal module service is unavailable. Ensure the paypal module is registered."
-      )
-    }
-    const creds = await paypal.getActiveCredentials()
-    const base =
-      creds.environment === "live"
-        ? "https://api-m.paypal.com"
-        : "https://api-m.sandbox.paypal.com"
-    const accessToken = await paypal.getAppAccessToken()
-    return { accessToken, base }
-  }
-
-  private async getOrderDetails(orderId: string) {
-    const { accessToken, base } = await this.getPayPalAccessToken()
-    const resp = await paypalFetch(`${base}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "PayPal-Partner-Attribution-Id": BN_CODE,
-      },
-    })
-
-    const text = await resp.text()
-    if (!resp.ok) {
-      throw new Error(`PayPal get order error (${resp.status}): ${text}`)
-    }
-
-    return JSON.parse(text)
-  }
-
-  private getIdempotencyKey(
-    input: { context?: { idempotency_key?: string } },
-    suffix: string
-  ) {
-    const key = input?.context?.idempotency_key?.trim()
-    if (key) {
-      return `${key}-${suffix}`
-    }
-    return `pp-${suffix}-${generateSessionId()}`
-  }
-
-  private async normalizePaymentData(input: { data?: Record<string, unknown> }) {
-    const data = (input.data || {}) as Record<string, any>
-    const amount = Number(data.amount ?? 0)
-    const currencyOverride = await this.resolveCurrencyOverride()
-    const currencyCode = normalizeCurrencyCode(
-      data.currency_code || currencyOverride || "EUR"
-    )
-    assertPayPalCurrencySupported({
-      currencyCode,
-      paypalCurrencyOverride: currencyOverride,
-    })
-    return { data, amount, currencyCode }
-  }
-
-  private mapCaptureStatus(status?: string) {
-    return mapPayPalCaptureStatus(status)
-  }
-
-  private mapAuthorizationStatus(status?: string) {
-    const normalized = String(status || "").toUpperCase()
-    if (!normalized) return null
-    if (["CREATED", "APPROVED", "PENDING"].includes(normalized)) return "authorized"
-    if (["VOIDED", "EXPIRED"].includes(normalized)) return "canceled"
-    if (["DENIED", "DECLINED", "FAILED"].includes(normalized)) return "error"
-    return null
-  }
+  protected readonly sessionPrefix = "pp"
+  protected readonly idempotencyPrefix = "pp"
 
   private serializeError(error: unknown) {
     if (error instanceof Error) {
@@ -189,58 +54,17 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
     return { message: String(error) }
   }
 
-  private mapOrderStatus(status?: string) {
-    const normalized = String(status || "").toUpperCase()
-    if (!normalized) return "pending"
-    if (normalized === "COMPLETED") return "captured"
-    if (normalized === "APPROVED") return "authorized"
-    if (["VOIDED", "CANCELLED"].includes(normalized)) return "canceled"
-    if (["CREATED", "SAVED", "PAYER_ACTION_REQUIRED"].includes(normalized)) return "pending"
-    if (["FAILED", "EXPIRED"].includes(normalized)) return "error"
-    return "pending"
-  }
-
   private async recordFailure(eventType: string, metadata?: Record<string, unknown>) {
-    const paypal = this.resolvePayPalService()
-    if (!paypal) return
-    try {
-      await paypal.recordPaymentLog(eventType, metadata)
-      await paypal.recordAuditEvent(eventType, metadata)
-      await paypal.recordMetric(eventType)
-    } catch {
-    }
+    await this.paypal.recordAuditEvent(eventType, metadata)
+    await this.paypal.recordMetric(eventType, metadata)
   }
 
   private async recordSuccess(metricName: string) {
-    const paypal = this.resolvePayPalService()
-    if (!paypal) return
-    try {
-      await paypal.recordMetric(metricName)
-    } catch {
-    }
+    await this.paypal.recordMetric(metricName)
   }
 
   private async recordPaymentEvent(eventType: string, metadata?: Record<string, unknown>) {
-    const paypal = this.resolvePayPalService()
-    if (!paypal) return
-    try {
-      await paypal.recordPaymentLog(eventType, metadata)
-    } catch {
-    }
-  }
-
-  async createAccountHolder(
-    input: CreateAccountHolderInput
-  ): Promise<CreateAccountHolderOutput> {
-    const customerId = input.context?.customer?.id
-    const externalId = customerId ? `paypal_${customerId}` : `paypal_${generateSessionId()}`
-    return {
-      id: externalId,
-      data: {
-        email: input.context?.customer?.email || null,
-        customer_id: customerId || null,
-      },
-    }
+    await this.paypal.recordAuditEvent(eventType, metadata)
   }
 
   async initiatePayment(input: InitiatePaymentInput): Promise<InitiatePaymentOutput> {
@@ -255,7 +79,7 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
         paypalCurrencyOverride: currencyOverride,
       })
       return {
-        id: generateSessionId(),
+        id: this.generateSessionId(),
         data: {
           ...(input.data || {}),
           ...(providerId ? { provider_id: providerId } : {}),
@@ -288,6 +112,7 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
     return {
       data: {
         ...(input.data || {}),
+        ...this.invalidateStaleOrder(input, currencyCode),
         ...(providerId ? { provider_id: providerId } : {}),
         amount: input.amount,
         currency_code: currencyCode,
@@ -298,29 +123,22 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
   async authorizePayment(
     input: AuthorizePaymentInput
   ): Promise<AuthorizePaymentOutput> {
-    const { data, amount, currencyCode } = await this.normalizePaymentData(input)
+    const { data } = await this.normalizePaymentData(input)
     const existingPayPal = (data.paypal || {}) as Record<string, any>
 
-    const { additionalSettings } = await this.resolveSettings()
-    const paymentActionRaw =
-      typeof additionalSettings.paymentAction === "string"
-        ? additionalSettings.paymentAction
-        : "capture"
-    const returnStatus = paymentActionRaw === "authorize" ? "authorized" : "captured"
-    const timestampKey = paymentActionRaw === "authorize" ? "authorized_at" : "captured_at"
-
-    if (
-      existingPayPal.capture_id ||
-      existingPayPal.authorization_id ||
-      (data as any).authorized_at ||
-      (data as any).captured_at
-    ) {
-      console.info("[PayPal] authorizePayment: session already processed, returning", returnStatus)
+    // Session already carries a settled capture: trust it without a network
+    // round-trip. The stored capture object is only written after a COMPLETED
+    // gate (capture-order route / capturePayment), but re-verify its status
+    // here so a PENDING/DECLINED capture patched in by a webhook is never
+    // booked as captured money.
+    const storedCaptureStatus = extractCaptureStatus(existingPayPal.capture)
+    if (storedCaptureStatus === "COMPLETED") {
+      console.info("[PayPal] authorizePayment: session already captured (COMPLETED)")
       return {
-        status: returnStatus,
+        status: "captured",
         data: {
           ...(input.data || {}),
-          [timestampKey]: (data as any)[timestampKey] || new Date().toISOString(),
+          captured_at: (data as any).captured_at || new Date().toISOString(),
         },
       }
     }
@@ -333,25 +151,92 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
         const capture = order?.purchase_units?.[0]?.payments?.captures?.[0]
         const authorization = order?.purchase_units?.[0]?.payments?.authorizations?.[0]
 
-        if (capture?.id || authorization?.id) {
-          console.info("[PayPal] authorizePayment: order already processed by PayPal, returning", returnStatus)
-          return {
-            status: returnStatus,
-            data: {
-              ...(input.data || {}),
-              paypal: {
-                ...existingPayPal,
-                order_id: orderId,
-                order,
-                authorization_id: authorization?.id || existingPayPal.authorization_id,
-                capture_id: capture?.id || existingPayPal.capture_id,
+        // Derive the returned status from what actually happened at PayPal —
+        // NOT from the mere presence of a capture/authorization id and NOT
+        // from the merchant's configured paymentAction. A PENDING capture
+        // (eCheck / pending review) must not be booked as captured, and a
+        // DENIED/DECLINED one must fail the authorization outright.
+        if (capture?.id) {
+          const captureStatus = this.mapCaptureStatus(capture?.status)
+          if (captureStatus === "captured") {
+            return {
+              status: "captured",
+              data: {
+                ...(input.data || {}),
+                paypal: {
+                  ...existingPayPal,
+                  order_id: orderId,
+                  order,
+                  authorization_id: authorization?.id || existingPayPal.authorization_id,
+                  capture_id: capture.id,
+                  capture,
+                },
+                captured_at: new Date().toISOString(),
               },
-              [timestampKey]: new Date().toISOString(),
-            },
+            }
+          }
+          if (captureStatus === "pending") {
+            // Funds are in flight (eCheck etc.): place the order as authorized
+            // so checkout completes, but never mark it captured — the
+            // CAPTURE.COMPLETED webhook settles it later.
+            return {
+              status: "authorized",
+              data: {
+                ...(input.data || {}),
+                paypal: {
+                  ...existingPayPal,
+                  order_id: orderId,
+                  order,
+                  capture_id: capture.id,
+                },
+                authorized_at: new Date().toISOString(),
+              },
+            }
+          }
+          if (captureStatus === "error" || captureStatus === "canceled") {
+            return {
+              status: "error",
+              data: {
+                ...(input.data || {}),
+                paypal: { ...existingPayPal, order_id: orderId, order },
+              },
+            }
           }
         }
 
-        if (["APPROVED", "CREATED", "SAVED"].includes(String(order?.status || "").toUpperCase())) {
+        if (authorization?.id) {
+          const authStatus = this.mapAuthorizationStatus(authorization?.status)
+          if (authStatus === "authorized") {
+            return {
+              status: "authorized",
+              data: {
+                ...(input.data || {}),
+                paypal: {
+                  ...existingPayPal,
+                  order_id: orderId,
+                  order,
+                  authorization_id: authorization.id,
+                },
+                authorized_at: new Date().toISOString(),
+              },
+            }
+          }
+          if (authStatus === "error" || authStatus === "canceled") {
+            return {
+              status: "error",
+              data: {
+                ...(input.data || {}),
+                paypal: { ...existingPayPal, order_id: orderId, order },
+              },
+            }
+          }
+        }
+
+        // Only a buyer-APPROVED order counts as authorized. CREATED/SAVED
+        // means the buyer never approved the payment — treating those as
+        // authorized would let a cart complete with no funds authorized at
+        // PayPal at all.
+        if (String(order?.status || "").toUpperCase() === "APPROVED") {
           console.info("[PayPal] authorizePayment: order approved, marking authorized")
           return {
             status: "authorized",
@@ -368,133 +253,49 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
         }
       } catch (e: any) {
         console.warn("[PayPal] authorizePayment: order lookup failed:", e?.message)
-      }
-    }
-
-    const requestId = this.getIdempotencyKey(input, "authorize")
-    let debugId: string | null = null
-    const orderIntent = paymentActionRaw === "authorize" ? "AUTHORIZE" : "CAPTURE"
-
-    try {
-      const { accessToken, base } = await this.getPayPalAccessToken()
-      const value = formatAmountForPayPal(amount, currencyCode || "EUR")
-
-      const orderPayload = {
-        intent: orderIntent,
-        purchase_units: [
-          {
-            reference_id: data.cart_id || data.payment_collection_id || undefined,
-            custom_id:
-              data.session_id || data.cart_id || data.payment_collection_id || undefined,
-            amount: {
-              currency_code: currencyCode || "EUR",
-              value,
-            },
-          },
-        ],
-        custom_id:
-          data.session_id || data.cart_id || data.payment_collection_id || undefined,
-      }
-
-      const ppResp = await paypalFetch(`${base}/v2/checkout/orders`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          "PayPal-Request-Id": requestId,
-          "PayPal-Partner-Attribution-Id": BN_CODE,
-        },
-        body: JSON.stringify(orderPayload),
-      })
-
-      const ppText = await ppResp.text()
-      debugId = ppResp.headers.get("paypal-debug-id")
-      if (!ppResp.ok) {
-        throw new Error(
-          `PayPal create order error (${ppResp.status}): ${ppText}${
-            debugId ? ` debug_id=${debugId}` : ""
-          }`
-        )
-      }
-
-      const order = JSON.parse(ppText) as Record<string, any>
-      const newOrderId = String(order.id || "")
-
-      if (!order || !newOrderId) {
-        throw new Error("Unable to resolve PayPal order details for authorization.")
-      }
-
-      const existingAuthorization =
-        order?.purchase_units?.[0]?.payments?.authorizations?.[0] || null
-
-      let authorization: any = null
-      if (existingAuthorization) {
-        authorization = order
-      } else {
-        const authorizeResp = await paypalFetch(
-          `${base}/v2/checkout/orders/${encodeURIComponent(newOrderId)}/authorize`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              "Content-Type": "application/json",
-              "PayPal-Request-Id": `${requestId}-auth`,
-              "PayPal-Partner-Attribution-Id": BN_CODE,
+        // Fall back to the session's own record when PayPal is unreachable so a
+        // transient lookup error doesn't fail a checkout that already has a
+        // real authorization/capture behind it. `captured_at` is only ever
+        // stamped after a COMPLETED gate; a bare capture_id (e.g. patched in by
+        // a webhook) or authorization id maps to "authorized" — the order is
+        // placed without claiming settled funds.
+        if ((data as any).captured_at) {
+          return {
+            status: "captured",
+            data: { ...(input.data || {}), captured_at: (data as any).captured_at },
+          }
+        }
+        if (
+          existingPayPal.capture_id ||
+          existingPayPal.authorization_id ||
+          (data as any).authorized_at
+        ) {
+          return {
+            status: "authorized",
+            data: {
+              ...(input.data || {}),
+              authorized_at: (data as any).authorized_at || new Date().toISOString(),
             },
           }
-        )
-
-        const authorizeText = await authorizeResp.text()
-        const authorizeDebugId = authorizeResp.headers.get("paypal-debug-id")
-        if (!authorizeResp.ok) {
-          throw new Error(
-            `PayPal authorize order error (${authorizeResp.status}): ${authorizeText}${
-              authorizeDebugId ? ` debug_id=${authorizeDebugId}` : ""
-            }`
-          )
         }
-
-        authorization = JSON.parse(authorizeText)
       }
-
-      const authorizationId =
-        authorization?.purchase_units?.[0]?.payments?.authorizations?.[0]?.id ||
-        existingAuthorization?.id
-
-      await this.recordSuccess("authorize_success")
-      await this.recordPaymentEvent("authorize", {
-        order_id: newOrderId,
-        authorization_id: authorizationId,
-        amount,
-        currency_code: currencyCode,
-        request_id: requestId,
-      })
-
-      return {
-        status: "authorized",
-        data: {
-          ...(input.data || {}),
-          paypal: {
-            ...((input.data || {}).paypal as Record<string, unknown>),
-            order_id: newOrderId,
-            order: order || authorization,
-            authorization_id: authorizationId,
-            authorizations:
-              authorization?.purchase_units?.[0]?.payments?.authorizations || [],
-          },
-          authorized_at: new Date().toISOString(),
-        },
-      }
-    } catch (error: any) {
-      await this.recordFailure("authorize_failed", {
-        request_id: requestId,
-        cart_id: data.cart_id,
-        payment_collection_id: data.payment_collection_id,
-        debug_id: debugId,
-        message: error?.message,
-      })
-      throw error
     }
+
+    // No usable PayPal order on the session: nothing can be authorized. The
+    // previous fallback created a brand-new PayPal order here and immediately
+    // called /v2/checkout/orders/{id}/authorize on it — but an order no buyer
+    // has approved can never be authorized (PayPal rejects it with
+    // ORDER_NOT_APPROVED), so that path only produced confusing 422s and
+    // orphaned PayPal orders. Fail with a clear, actionable error instead.
+    await this.recordFailure("authorize_failed", {
+      cart_id: data.cart_id,
+      payment_collection_id: data.payment_collection_id,
+      message: "no approved PayPal order on session",
+    })
+    throw new MedusaError(
+      MedusaError.Types.NOT_ALLOWED,
+      "No approved PayPal payment was found for this session. The buyer must approve the payment with PayPal before the cart can be completed."
+    )
   }
 
   async retrievePayment(input: RetrievePaymentInput): Promise<RetrievePaymentOutput> {
@@ -587,7 +388,11 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
       }
     }
 
-    const { amount, currencyCode } = await this.normalizePaymentData(input)
+    const { amount: sessionAmount, currencyCode } = await this.normalizePaymentData(input)
+    // The requested (possibly partial) capture amount lives on the Medusa
+    // capture row, not in the provider input — resolve it so partial captures
+    // don't charge the full session total.
+    const amount = await this.resolveRequestedCaptureAmount(input, sessionAmount)
     // Include the amount in the idempotency suffix: PayPal deduplicates by
     // PayPal-Request-Id, so two sequential partial captures of the same order
     // that share an upstream idempotency_key would otherwise collide and the
@@ -626,7 +431,7 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
               Authorization: `Bearer ${accessToken}`,
               "Content-Type": "application/json",
               "PayPal-Request-Id": `${requestId}-auth`,
-              "PayPal-Partner-Attribution-Id": BN_CODE,
+              "PayPal-Partner-Attribution-Id": PAYPAL_PARTNER_ATTRIBUTION_ID,
             },
           }
         )
@@ -682,13 +487,16 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
         }
       }
 
-      const ppResp = await paypalFetch(captureUrl, {
+      // Retry transient 5xx/429/timeout: the PayPal-Request-Id makes the
+      // capture idempotent, so a retry after a network blip re-uses the same
+      // capture instead of double-charging.
+      const ppResp = await paypalFetchWithRetry(captureUrl, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
           "PayPal-Request-Id": requestId,
-          "PayPal-Partner-Attribution-Id": BN_CODE,
+          "PayPal-Partner-Attribution-Id": PAYPAL_PARTNER_ATTRIBUTION_ID,
         },
         body: JSON.stringify(capturePayload),
       })
@@ -758,7 +566,12 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
         debug_id: debugId,
         message: error?.message,
       })
-      throw error
+      throw error instanceof MedusaError
+        ? error
+        : new MedusaError(
+            MedusaError.Types.INVALID_DATA,
+            error?.message || "PayPal capture failed."
+          )
     }
   }
 
@@ -820,13 +633,16 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
         refundPayload.note_to_payer = refundReason.slice(0, 255)
       }
 
-      const ppResp = await paypalFetch(`${base}/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
+      // Retry transient 5xx/429/timeout: the PayPal-Request-Id (which includes
+      // the refund amount) makes the refund idempotent, so a retry after a
+      // network blip re-uses the same refund instead of double-refunding.
+      const ppResp = await paypalFetchWithRetry(`${base}/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
           "PayPal-Request-Id": requestId,
-          "PayPal-Partner-Attribution-Id": BN_CODE,
+          "PayPal-Partner-Attribution-Id": PAYPAL_PARTNER_ATTRIBUTION_ID,
         },
         body: JSON.stringify(refundPayload),
       })
@@ -898,13 +714,10 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
         debug_id: debugId,
         message: error?.message,
       })
-      // Surface the real reason to the admin. Medusa's error handler masks any
-      // non-MedusaError as a generic "An unknown error occurred." in production,
-      // which hid the actual PayPal failure from the order refund UI.
       throw error instanceof MedusaError
         ? error
         : new MedusaError(
-            MedusaError.Types.UNEXPECTED_STATE,
+            MedusaError.Types.INVALID_DATA,
             error?.message || "PayPal refund failed."
           )
     }
@@ -939,7 +752,7 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
               Authorization: `Bearer ${accessToken}`,
               "Content-Type": "application/json",
               "PayPal-Request-Id": requestId,
-              "PayPal-Partner-Attribution-Id": BN_CODE,
+              "PayPal-Partner-Attribution-Id": PAYPAL_PARTNER_ATTRIBUTION_ID,
             },
           }
         )
@@ -969,7 +782,7 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
             Authorization: `Bearer ${accessToken}`,
             "Content-Type": "application/json",
             "PayPal-Request-Id": requestId,
-            "PayPal-Partner-Attribution-Id": BN_CODE,
+            "PayPal-Partner-Attribution-Id": PAYPAL_PARTNER_ATTRIBUTION_ID,
           },
           body: JSON.stringify({}),
         })
@@ -1035,15 +848,6 @@ class PayPalPaymentProvider extends AbstractPaymentProvider<Options> {
     }
   }
 
-  async deletePayment(_input: DeletePaymentInput): Promise<DeletePaymentOutput> {
-    return { data: {} }
-  }
-
-  async getWebhookActionAndData(
-    payload: ProviderWebhookPayload["payload"]
-  ): Promise<WebhookActionResult> {
-    return getPayPalWebhookActionAndData(payload)
-  }
 }
 
 export default PayPalPaymentProvider

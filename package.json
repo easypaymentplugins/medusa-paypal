@@ -1,7 +1,7 @@
 {
   "name": "@easypayment/medusa-payment-paypal",
-  "version": "0.9.29",
-  "description": "PayPal integration for Medusa v2",
+  "version": "1.1.2",
+  "description": "PayPal for Medusa v2 — Built by a PayPal Partner.",
   "author": "EasyPayment Plugins",
   "license": "MIT",
   "main": "./.medusa/server/src/index.js",
@@ -12,13 +12,13 @@
     "scripts",
     "package.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "tsconfig.json"
   ],
   "exports": {
     "./package.json": "./package.json",
     "./admin": "./.medusa/server/src/admin/index.mjs",
-    "./workflows": "./.medusa/server/src/workflows/index.js",
     "./providers/paypal": "./.medusa/server/src/providers/paypal/index.js",
     "./providers/paypal_card": "./.medusa/server/src/providers/paypal_card/index.js",
     "./modules/paypal": "./.medusa/server/src/modules/paypal/index.js",
@@ -29,7 +29,6 @@
     "./.medusa/server/src/providers/paypal": "./.medusa/server/src/providers/paypal/index.js",
     "./.medusa/server/src/providers/paypal_card": "./.medusa/server/src/providers/paypal_card/index.js",
     "./.medusa/server/src/admin": "./.medusa/server/src/admin/index.mjs",
-    "./.medusa/server/src/workflows": "./.medusa/server/src/workflows/index.js",
     "./.medusa/server/src/*": "./.medusa/server/src/*.js",
     "./.medusa/*": "./.medusa/*"
   },
@@ -44,25 +43,32 @@
     "@medusajs/admin-sdk": "2.12.5",
     "@medusajs/cli": "2.12.5",
     "@medusajs/framework": "2.12.5",
+    "@medusajs/icons": "2.12.5",
     "@medusajs/medusa": "2.12.5",
     "@medusajs/test-utils": "2.12.5",
     "@medusajs/ui": "^4.0.0",
-    "@medusajs/icons": "2.12.5",
     "@swc/core": "^1.5.7",
+    "ts-node": "^10.9.2",
     "typescript": "^5.6.2",
     "vitest": "^2.0.5"
   },
   "peerDependencies": {
     "@medusajs/admin-sdk": "^2.12.0",
     "@medusajs/framework": "^2.12.0",
+    "@medusajs/icons": "^2.12.0",
     "@medusajs/medusa": "^2.12.0",
-    "@medusajs/ui": "^4.0.0",
-    "@medusajs/icons": "^2.12.0"
+    "@medusajs/ui": "^4.0.0"
   },
   "peerDependenciesMeta": {
-    "@medusajs/admin-sdk": { "optional": true },
-    "@medusajs/ui": { "optional": true },
-    "@medusajs/icons": { "optional": true }
+    "@medusajs/admin-sdk": {
+      "optional": true
+    },
+    "@medusajs/ui": {
+      "optional": true
+    },
+    "@medusajs/icons": {
+      "optional": true
+    }
   },
   "publishConfig": {
     "access": "public"
@@ -76,6 +82,7 @@
   },
   "keywords": [
     "medusa-v2",
-    "medusa-plugin-integration"
+    "medusa-plugin-integration",
+	"medusa-plugin-payment"
   ]
 }

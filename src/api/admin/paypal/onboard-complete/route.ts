@@ -1,4 +1,8 @@
-import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import type {
+  AuthenticatedMedusaRequest,
+  MedusaRequest,
+  MedusaResponse,
+} from "@medusajs/framework/http"
 import type PayPalModuleService from "../../../../modules/paypal/service"
 
 /**
@@ -15,7 +19,11 @@ export async function GET(_req: MedusaRequest, res: MedusaResponse) {
   })
 }
 
-export async function POST(req: MedusaRequest, res: MedusaResponse) {
+// Typed as AuthenticatedMedusaRequest: every /admin/* route is gated by
+// Medusa's built-in admin authentication, so this credential-exchange endpoint
+// only runs for an authenticated admin. The typed request makes that contract
+// explicit (and gives access to the authenticated actor if ever needed).
+export async function POST(req: AuthenticatedMedusaRequest, res: MedusaResponse) {
   const paypal = req.scope.resolve<PayPalModuleService>("paypal_onboarding")
   const body = req.body as { authCode?: string; sharedId?: string; env?: "sandbox" | "live" }
 

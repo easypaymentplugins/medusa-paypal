@@ -31,6 +31,10 @@ function resolveIdempotencyKey(req: MedusaRequest, suffix: string, fallback: str
     req.headers["X-Idempotency-Key"]
   const key = Array.isArray(header) ? header[0] : header
   if (key && String(key).trim()) {
+    // The suffix must include the cart id (callers pass it): PayPal caches by
+    // PayPal-Request-Id, so a client reusing one idempotency-key header across
+    // two carts would otherwise get cart A's cached order (A's amount) back
+    // for cart B.
     return `${String(key).trim()}-${suffix}`
   }
   return fallback || `pp-${suffix}-${randomUUID()}`
@@ -102,10 +106,11 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
       return res.status(400).json({ message: "Invalid cart_id format" })
     }
 
+    // A stored order id is only reused after verifying it still matches the
+    // cart (amount/currency/state) — see below, once the cart is loaded. Buyers
+    // who back out of the PayPal popup and change their cart would otherwise be
+    // charged the stale total.
     const existingOrderId = await getExistingPayPalOrderId(req, cartId)
-    if (existingOrderId) {
-      return res.json({ id: existingOrderId })
-    }
 
     const query = req.scope.resolve("query")
 
@@ -180,6 +185,57 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     const exponent = getCurrencyExponent(currency)
     const totalMajor = Number(cart.total || 0)
     const value = totalMajor.toFixed(exponent)
+
+    // Reuse the stored PayPal order only when it still matches the cart: same
+    // amount, same currency, and still in a reusable (pre-terminal) state. On
+    // mismatch fall through and create a fresh order (which replaces the
+    // stored id on the session). If PayPal can't be reached for the check,
+    // reuse the stored id — matching the previous behavior rather than
+    // blocking checkout on a transient error.
+    if (existingOrderId) {
+      try {
+        const checkBase = getPayPalApiBase(creds.environment)
+        const checkToken = await paypal.getAppAccessToken()
+        const checkResp = await paypalFetch(
+          `${checkBase}/v2/checkout/orders/${encodeURIComponent(existingOrderId)}`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${checkToken}`,
+              "Content-Type": "application/json",
+            },
+          }
+        )
+        if (checkResp.ok) {
+          const existingOrder = await checkResp.json()
+          const existingAmount = existingOrder?.purchase_units?.[0]?.amount
+          const existingStatus = String(existingOrder?.status || "").toUpperCase()
+          const reusableStatus = ["CREATED", "APPROVED", "PAYER_ACTION_REQUIRED"].includes(
+            existingStatus
+          )
+          const amountMatches =
+            String(existingAmount?.value || "") === value &&
+            String(existingAmount?.currency_code || "").toUpperCase() === currency
+          if (reusableStatus && amountMatches) {
+            return res.json({ id: existingOrderId })
+          }
+          if (existingStatus === "COMPLETED") {
+            // Already paid — never mint a second order for this cart.
+            return res.json({ id: existingOrderId })
+          }
+          logger.info(
+            `[paypal] create-order: stored order ${existingOrderId} is stale (status=${existingStatus}, amount=${existingAmount?.value} ${existingAmount?.currency_code} vs cart ${value} ${currency}) — creating a fresh order (request_id=${requestId})`
+          )
+        } else if (checkResp.status !== 404) {
+          // Transient PayPal-side failure: reuse rather than block checkout.
+          return res.json({ id: existingOrderId })
+        }
+        // 404: the stored order no longer exists (e.g. environment switched) —
+        // fall through and create a fresh one.
+      } catch {
+        return res.json({ id: existingOrderId })
+      }
+    }
 
     const paymentActionRaw =
       typeof additionalSettings.paymentAction === "string"
@@ -378,7 +434,11 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     // Deterministic-per-cart idempotency key for the PayPal call. Kept distinct
     // from `requestId` (the log/response correlation id declared at the top of
     // POST) so the two never shadow each other.
-    const paypalRequestId = resolveIdempotencyKey(req, "create-order", `pp-create-${cart.id}`)
+    const paypalRequestId = resolveIdempotencyKey(
+      req,
+      `create-order-${cart.id}`,
+      `pp-create-${cart.id}`
+    )
 
     const ppResp = await paypalFetch(`${base}/v2/checkout/orders`, {
       method: "POST",

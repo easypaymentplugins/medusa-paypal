@@ -8,7 +8,7 @@ import { runCoreWorkflow } from "../../../modules/paypal/utils/core-workflow"
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const logger = req.scope.resolve<Logger>(ContainerRegistrationKeys.LOGGER)
   const requestId = randomUUID()
-  const { cart_id } = req.body as { cart_id: string }
+  const { cart_id } = (req.body || {}) as { cart_id: string }
 
   if (!cart_id || typeof cart_id !== "string") {
     return res.status(400).json({ message: "cart_id is required" })

@@ -367,9 +367,11 @@ export default function PayPalConnectionPage() {
           body: JSON.stringify({ products: ["PPCP"], environment: targetEnv }),
         })
 
-        if (!res.ok) throw new Error(`Service returned ${res.status}`)
-
         const data = await res.json()
+
+        if (!res.ok) {
+          throw new Error(data?.message || `Service returned ${res.status}`)
+        }
         if (runId !== currentRunId.current) return
 
         const href = data?.onboarding_url
@@ -383,9 +385,9 @@ export default function PayPalConnectionPage() {
 
         writeCachedUrl(targetEnv, url)
         activatePayPal(url, runId)
-      } catch {
+      } catch (err: any) {
         if (runId !== currentRunId.current) return
-        showError("Unable to connect to service.")
+        showError(err?.message || "Unable to connect to service.")
       }
     },
     [activatePayPal, showError]

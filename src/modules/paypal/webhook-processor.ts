@@ -100,6 +100,19 @@ export function normalizeEventVersion(payload: Record<string, any>): string | nu
 }
 
 
+/** Pull the capture id out of a refund resource's "up" HATEOAS link. */
+export function extractCaptureIdFromLinks(
+  resource: Record<string, any>
+): string | null {
+  const links = Array.isArray(resource?.links) ? resource.links : []
+  for (const link of links) {
+    const href = String(link?.href || "")
+    const match = href.match(/\/captures\/([A-Za-z0-9-]+)/)
+    if (match) return match[1]
+  }
+  return null
+}
+
 export interface ExtractedIdentifiers {
   orderId: string | null
   captureId: string | null
@@ -133,7 +146,21 @@ export function extractIdentifiers(
         resource?.purchase_units?.[0]?.payments?.captures?.[0]?.id || ""
       ).trim() || null
   } else if (isCapture) {
-    captureId = String(resource?.id || "").trim() || null
+    // PAYMENT.CAPTURE.REFUNDED / REVERSED carry a *refund* resource (its `id`
+    // is the refund id, with an "up" link to the capture) — treating that id
+    // as the capture id would corrupt the session's stored capture_id.
+    const isRefundShaped =
+      eventType === "PAYMENT.CAPTURE.REFUNDED" ||
+      eventType === "PAYMENT.CAPTURE.REVERSED"
+    if (isRefundShaped) {
+      refundId = String(resource?.id || "").trim() || null
+      captureId =
+        String(related?.capture_id || "").trim() ||
+        extractCaptureIdFromLinks(resource) ||
+        null
+    } else {
+      captureId = String(resource?.id || "").trim() || null
+    }
     orderId = String(related?.order_id || "").trim() || null
     cartId = String(resource?.custom_id || "").trim() || null
   } else if (isAuthorization) {
@@ -183,7 +210,7 @@ async function findPayPalSession(
 
   const sessions = await paymentModule.listPaymentSessions({
     payment_collection_id: collection.id,
-  })
+  }, { take: 50 })
 
   const paypalSession = (sessions || [])
     .filter((s: any) => isPayPalProviderId(s.provider_id))
@@ -223,12 +250,14 @@ function mergeRefunds(existing: any[], incoming: any[]): any[] {
 async function applyStatusToSession(
   container: MedusaContainer,
   resolved: ResolvedSession,
-  status: string,
+  status: string | null,
   patch: Record<string, unknown>
 ): Promise<void> {
   const paymentModule = container.resolve(Modules.PAYMENT) as any
 
-  if (!isTransitionAllowed(resolved.sessionStatus, status)) {
+  // A null status means "record the data but keep the current session status"
+  // (e.g. a partial refund must not cancel a captured session).
+  if (status !== null && !isTransitionAllowed(resolved.sessionStatus, status)) {
     console.info(
       `[PayPal] webhook: skipping disallowed transition ${resolved.sessionStatus} → ${status} for session ${resolved.sessionId}`
     )
@@ -246,20 +275,59 @@ async function applyStatusToSession(
     ? mergeRefunds(existingRefunds, incomingRefunds)
     : existingRefunds
 
+  // Drop undefined/null values from the patch so a webhook that lacks an
+  // identifier (e.g. a capture event with no related_ids) can never clobber
+  // stored fields like `order_id` with null.
+  const cleanPatch: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(patch)) {
+    if (v !== undefined && v !== null) cleanPatch[k] = v
+  }
+
   await paymentModule.updatePaymentSession({
     id: resolved.sessionId,
-    status,
+    status: status === null ? resolved.sessionStatus : status,
     data: {
       ...resolved.sessionData,
       paypal: {
         ...existingPaypal,
-        ...patch,
+        ...cleanPatch,
         refunds: nextRefunds,
       },
     },
   })
 }
 
+
+/**
+ * True when a refund resource demonstrably covers less than the captured
+ * amount. Uses the refund's cumulative `total_refunded_amount` (falling back
+ * to the single refund amount) against the capture amount stored on the
+ * session (falling back to the session total). Returns false — i.e. treat as
+ * a full refund, matching the previous behavior — whenever the amounts can't
+ * be determined.
+ */
+export function isPartialRefund(
+  resource: Record<string, any>,
+  sessionData: Record<string, any>
+): boolean {
+  const refundedRaw =
+    resource?.seller_payable_breakdown?.total_refunded_amount?.value ??
+    resource?.amount?.value
+  const refunded = Number(refundedRaw)
+  if (!Number.isFinite(refunded) || refunded <= 0) return false
+
+  const paypal = (sessionData?.paypal || {}) as Record<string, any>
+  const capturedRaw =
+    paypal?.capture?.amount?.value ??
+    paypal?.capture?.seller_receivable_breakdown?.gross_amount?.value ??
+    sessionData?.amount
+  const captured = Number(capturedRaw)
+  if (!Number.isFinite(captured) || captured <= 0) return false
+
+  // Tolerance for floating-point noise; amounts are decimal strings from
+  // PayPal or the session's stored major-unit amount.
+  return refunded + 0.005 < captured
+}
 
 export interface ProcessResult {
   orderId: string | null
@@ -300,21 +368,18 @@ export async function processPayPalWebhookEvent(
   if (!cartId && (orderId || captureId)) {
     try {
       const paymentModule = container.resolve(Modules.PAYMENT) as any
-      // Fallback when the webhook resource carries no custom_id: locate the
-      // PayPal session whose stored data matches this order_id / capture_id.
-      // Paginate to exhaustion rather than scanning a single fixed page — on a
-      // busy store the matching session is frequently beyond the first page, so
-      // a hard cap would silently drop capture/refund status updates.
       const PAGE_SIZE = 200
-      const MAX_PAGES = 100 // safety bound (20k sessions) against a misbehaving driver
+      const MAX_PAGES = 5
       let matchedSession: Record<string, unknown> | null = null
+      let totalScanned = 0
 
       for (let page = 0; page < MAX_PAGES && !matchedSession; page++) {
         const sessions = await paymentModule.listPaymentSessions(
           { provider_id: [...PAYPAL_PROVIDER_IDS] },
-          { take: PAGE_SIZE, skip: page * PAGE_SIZE }
+          { take: PAGE_SIZE, skip: page * PAGE_SIZE, order: { created_at: "DESC" } }
         )
         if (!sessions || sessions.length === 0) break
+        totalScanned += sessions.length
         matchedSession =
           sessions.find((s: Record<string, unknown>) => {
             const pp =
@@ -326,6 +391,14 @@ export async function processPayPalWebhookEvent(
         if (sessions.length < PAGE_SIZE) break
       }
 
+      if (!matchedSession && totalScanned >= MAX_PAGES * PAGE_SIZE) {
+        console.warn(
+          `[PayPal] webhook: cartId fallback scan hit limit (${totalScanned} sessions). ` +
+          `Event ${input.eventType} may be lost. Ensure custom_id is set on PayPal orders.`,
+          { orderId, captureId }
+        )
+      }
+
       if (matchedSession?.payment_collection_id) {
         const colls = await paymentModule.listPaymentCollections(
           { id: [matchedSession.payment_collection_id] },
@@ -333,10 +406,10 @@ export async function processPayPalWebhookEvent(
         )
         cartId = String(colls?.[0]?.cart_id || "").trim() || null
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.warn(
         `[PayPal] webhook: cartId fallback lookup failed for ${input.eventType}:`,
-        e?.message
+        e instanceof Error ? e.message : e
       )
     }
   }
@@ -359,10 +432,28 @@ export async function processPayPalWebhookEvent(
           ]
         : null
 
-      await applyStatusToSession(container, resolved, targetStatus, {
-        order_id: orderId,
+      // A PARTIAL refund must not cancel the session: PayPal fires
+      // PAYMENT.CAPTURE.REFUNDED / PAYMENT.REFUND.COMPLETED for partial
+      // refunds too, and flipping a substantially-paid session to "canceled"
+      // misrepresents the payment. Record the refund but keep the status
+      // unless the cumulative refunded total covers the captured amount (or
+      // the amounts can't be determined, preserving the old full-refund
+      // behavior).
+      let effectiveStatus: string | null = targetStatus
+      const isRefundEvent =
+        input.eventType === "PAYMENT.CAPTURE.REFUNDED" ||
+        input.eventType === "PAYMENT.CAPTURE.REVERSED" ||
+        input.eventType === "PAYMENT.REFUND.COMPLETED"
+      if (isRefundEvent && targetStatus === "canceled") {
+        if (isPartialRefund(resource, resolved.sessionData)) {
+          effectiveStatus = null
+        }
+      }
+
+      await applyStatusToSession(container, resolved, effectiveStatus, {
+        order_id: orderId ?? undefined,
         capture_id: captureId ?? resolved.sessionData.paypal?.capture_id ?? undefined,
-        refund_id: refundId,
+        refund_id: refundId ?? undefined,
         refund_status: refundId ? resource?.status : undefined,
         refund_reason: refundReason,
         refund_reason_code: refundReasonCode,

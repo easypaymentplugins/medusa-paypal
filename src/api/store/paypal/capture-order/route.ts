@@ -34,21 +34,29 @@ function resolveIdempotencyKey(req: MedusaRequest, suffix: string, fallback: str
   return fallback || `pp-${suffix}-${randomUUID()}`
 }
 
+/**
+ * Persist the capture onto the cart's PayPal session. Returns `true` when the
+ * data was written (or there was nothing to write because no session exists),
+ * and `false` when the write ultimately failed after retries. The caller must
+ * NOT silently treat a `false` here as success: the funds were captured at
+ * PayPal, so a persistence failure has to be recorded/alerted (the webhook and
+ * paypal-complete's live re-derivation are the reconciliation backstop).
+ */
 async function attachPayPalCaptureToSession(
   cartId: string,
   orderId: string,
   capture: any,
   scope: any
-) {
+): Promise<boolean> {
+  const session = await findPayPalSessionForCart(cartId, scope)
+  if (!session) {
+    console.warn("[PayPal] attachPayPalCaptureToSession: no session found for cart", cartId)
+    return true
+  }
+
+  const captureId = capture?.purchase_units?.[0]?.payments?.captures?.[0]?.id || capture?.id
+
   try {
-    const session = await findPayPalSessionForCart(cartId, scope)
-    if (!session) {
-      console.warn("[PayPal] attachPayPalCaptureToSession: no session found for cart", cartId)
-      return
-    }
-
-    const captureId = capture?.purchase_units?.[0]?.payments?.captures?.[0]?.id || capture?.id
-
     await updatePayPalSessionData(
       session.session_id,
       {
@@ -61,8 +69,13 @@ async function attachPayPalCaptureToSession(
       },
       scope
     )
-
-  } catch {
+    return true
+  } catch (e: unknown) {
+    console.error(
+      "[PayPal] attachPayPalCaptureToSession failed:",
+      e instanceof Error ? e.message : e
+    )
+    return false
   }
 }
 
@@ -71,16 +84,16 @@ async function attachPayPalAuthorizationToSession(
   orderId: string,
   authorization: any,
   scope: any
-) {
+): Promise<boolean> {
+  const session = await findPayPalSessionForCart(cartId, scope)
+  if (!session) {
+    console.warn("[PayPal] attachPayPalAuthorizationToSession: no session found for cart", cartId)
+    return true
+  }
+
+  const authorizationId = authorization?.purchase_units?.[0]?.payments?.authorizations?.[0]?.id
+
   try {
-    const session = await findPayPalSessionForCart(cartId, scope)
-    if (!session) {
-      console.warn("[PayPal] attachPayPalAuthorizationToSession: no session found for cart", cartId)
-      return
-    }
-
-    const authorizationId = authorization?.purchase_units?.[0]?.payments?.authorizations?.[0]?.id
-
     await updatePayPalSessionData(
       session.session_id,
       {
@@ -93,8 +106,13 @@ async function attachPayPalAuthorizationToSession(
       },
       scope
     )
-
-  } catch {
+    return true
+  } catch (e: unknown) {
+    console.error(
+      "[PayPal] attachPayPalAuthorizationToSession failed:",
+      e instanceof Error ? e.message : e
+    )
+    return false
   }
 }
 
@@ -202,8 +220,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     }
 
     const payload = JSON.parse(ppText)
+    let persisted = true
     if (paymentAction === "authorize") {
-      await attachPayPalAuthorizationToSession(cartId, orderId, payload, req.scope)
+      persisted = await attachPayPalAuthorizationToSession(cartId, orderId, payload, req.scope)
     } else {
       // A 2xx capture response does NOT guarantee the funds settled: PayPal
       // returns 201 for PENDING (pending review / eCheck), DECLINED and FAILED
@@ -219,9 +238,30 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
           }`
         )
       }
-      await attachPayPalCaptureToSession(cartId, orderId, payload, req.scope)
+      persisted = await attachPayPalCaptureToSession(cartId, orderId, payload, req.scope)
     }
 
+    // The PayPal operation itself succeeded. If we could not persist it onto the
+    // Medusa session, the money is (authorized/)captured but Medusa doesn't yet
+    // record it — record a metric and log CRITICAL so it's observable/alertable.
+    // We still return success to the storefront: re-capturing would hit
+    // ORDER_ALREADY_CAPTURED, and both the webhook and paypal-complete's live
+    // PayPal re-derivation reconcile the session afterward.
+    if (!persisted) {
+      logger.error(
+        `[paypal] CRITICAL: ${
+          paymentAction === "authorize" ? "authorization" : "capture"
+        } succeeded at PayPal but could not be persisted to the session (request_id=${requestId}, cart_id=${cartId}, order_id=${orderId})`
+      )
+      try {
+        await paypal.recordMetric(
+          paymentAction === "authorize"
+            ? "authorize_order_persist_failed"
+            : "capture_order_persist_failed"
+        )
+      } catch {
+      }
+    }
 
     try {
       await paypal.recordMetric(

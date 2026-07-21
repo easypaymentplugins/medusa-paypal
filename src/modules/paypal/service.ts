@@ -133,7 +133,10 @@ class PayPalModuleService extends MedusaService({
   }
 
   private async getCurrentRow(): Promise<any | null> {
-    const rows = await this.listPayPalConnections({})
+    const rows = await this.listPayPalConnections(
+      {},
+      { take: 1, order: { created_at: "DESC" } }
+    )
     return rows?.[0] ?? null
   }
 
@@ -508,7 +511,10 @@ class PayPalModuleService extends MedusaService({
     // result to the opener, and closes the popup. We pin the environment in the
     // URL so the bridge saves credentials under the correct env even though
     // PayPal's redirect carries no auth/session.
-    const return_url = `${String(onboarding.backend_url || "").replace(/\/$/, "")}/store/paypal/onboard-return?env=${env}`
+    // Use the /hooks namespace: Medusa's publishable-key middleware rejects
+    // unauthenticated top-level navigations to /store/* routes, so the popup
+    // would land on a NOT_ALLOWED error page instead of the bridge.
+    const return_url = `${String(onboarding.backend_url || "").replace(/\/$/, "")}/hooks/paypal/onboard-return?env=${env}`
     const partner_merchant_id = await this.getPartnerMerchantId(env)
 
     const email = (input?.email || "").trim()
@@ -946,6 +952,17 @@ class PayPalModuleService extends MedusaService({
     if (!base) {
       throw new Error("PayPal backend URL is not configured.")
     }
+    // The /hooks namespace has no publishable-key guard. PayPal cannot send
+    // Medusa's x-publishable-api-key header, so a webhook registered at the
+    // old /store/paypal/webhook path is rejected before the handler runs.
+    return `${base}/hooks/paypal/webhook`
+  }
+
+  /** Legacy webhook path (blocked by Medusa's store publishable-key guard). */
+  private async resolveLegacyWebhookUrl() {
+    const { onboarding } = await this.ensureSettingsDefaults()
+    const base = String(onboarding.backend_url || "").replace(/\/$/, "")
+    if (!base) return ""
     return `${base}/store/paypal/webhook`
   }
 
@@ -958,12 +975,82 @@ class PayPalModuleService extends MedusaService({
     }
   }
 
+  // Only probe PayPal for a stale legacy webhook URL once per process per
+  // environment — this runs on admin status reads and must stay cheap.
+  private webhookUrlMigrationChecked: Record<string, boolean> = {}
+  private webhookHealScheduled: Record<string, boolean> = {}
+
+  private async migrateLegacyWebhookUrl(env: string, webhookId: string) {
+    if (this.webhookUrlMigrationChecked[env]) return
+    this.webhookUrlMigrationChecked[env] = true
+
+    const newUrl = await this.resolveWebhookUrl().catch(() => "")
+    const legacyUrl = await this.resolveLegacyWebhookUrl()
+    if (!newUrl || !legacyUrl || this.isLocalWebhookUrl(newUrl)) return
+
+    const accessToken = await this.getAppAccessToken()
+    const baseUrl =
+      env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+
+    const getResp = await paypalFetch(
+      `${baseUrl}/v1/notifications/webhooks/${encodeURIComponent(webhookId)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "PayPal-Partner-Attribution-Id": this.bnCode,
+        },
+      }
+    )
+    const getJson = await getResp.json().catch(() => ({}))
+    if (!getResp.ok) return
+
+    const currentUrl = String(getJson?.url || "")
+    if (currentUrl !== legacyUrl) return
+
+    const patchResp = await paypalFetch(
+      `${baseUrl}/v1/notifications/webhooks/${encodeURIComponent(webhookId)}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "PayPal-Partner-Attribution-Id": this.bnCode,
+        },
+        body: JSON.stringify([
+          { op: "replace", path: "/url", value: newUrl },
+        ]),
+      }
+    )
+    if (patchResp.ok) {
+      await this.recordAuditEvent("webhook_url_migrated", {
+        environment: env,
+        webhook_id: webhookId,
+        from: legacyUrl,
+        to: newUrl,
+      })
+      console.info(
+        `[PayPal] migrated webhook ${webhookId} URL from ${legacyUrl} to ${newUrl}`
+      )
+    }
+  }
+
   private async ensureWebhookRegistration() {
     const env = await this.getCurrentEnvironment()
     const { apiDetails } = await this.ensureSettingsDefaults()
     const webhookIds = { ...(apiDetails.webhook_ids || {}) } as Record<string, string>
 
     if (webhookIds[env]) {
+      // Existing installs registered the webhook at /store/paypal/webhook,
+      // which Medusa's publishable-key middleware blocks for external callers.
+      // Migrate the registered URL to /hooks/paypal/webhook in place
+      // (best-effort — a failure keeps the stored id and current behavior).
+      await this.migrateLegacyWebhookUrl(env, webhookIds[env]).catch((e: any) => {
+        console.warn(
+          "[PayPal] webhook URL migration check failed:",
+          e?.message || e
+        )
+      })
       return webhookIds[env]
     }
 
@@ -1090,6 +1177,19 @@ class PayPalModuleService extends MedusaService({
     const hasCreds = !!(c.clientId && c.clientSecret)
     let sellerEmail: string | null = c.sellerEmail || row.seller_email || null
     let sellerMerchantId: string | null = c.sellerMerchantId || row.seller_merchant_id || null
+
+    // Self-heal the webhook registration for already-connected merchants:
+    // installs that registered the webhook at the old (blocked)
+    // /store/paypal/webhook path get migrated to /hooks/paypal/webhook the
+    // first time an admin views the status page after upgrading. Fire and
+    // forget — status reads must never block on PayPal, and the migration is
+    // throttled to once per process per environment internally.
+    if (hasCreds && !this.webhookHealScheduled[env]) {
+      this.webhookHealScheduled[env] = true
+      void this.ensureWebhookRegistration().catch((e: any) => {
+        console.warn("[PayPal] webhook self-heal failed:", e?.message || e)
+      })
+    }
 
     if (!sellerEmail && hasCreds && opts.hydrateMissingProfile) {
       try {
@@ -1263,7 +1363,7 @@ class PayPalModuleService extends MedusaService({
   }
 
   async getSettings() {
-    const rows = await this.listPayPalSettings({})
+    const rows = await this.listPayPalSettings({}, { take: 1 })
     const row = rows?.[0]
     return { data: (row?.data || {}) as Record<string, any> }
   }
@@ -1293,7 +1393,7 @@ class PayPalModuleService extends MedusaService({
   }
 
   async saveSettings(patch: Record<string, any>) {
-    const rows = await this.listPayPalSettings({})
+    const rows = await this.listPayPalSettings({}, { take: 1 })
     const row = rows?.[0]
     const current = (row?.data || {}) as Record<string, any>
 
@@ -1454,28 +1554,45 @@ class PayPalModuleService extends MedusaService({
   }
 
   async recordMetric(name: string, metadata?: Record<string, unknown>) {
-    const existing = await this.listPayPalMetrics({ name })
-    const row = existing?.[0]
-    const current = (row?.data || {}) as Record<string, any>
-    const next = {
-      ...current,
-      ...(metadata || {}),
-      count: Number(current.count || 0) + 1,
-      last_recorded_at: new Date().toISOString(),
-    }
+    try {
+      const existing = await this.listPayPalMetrics({ name })
+      const row = existing?.[0]
+      const current = (row?.data || {}) as Record<string, any>
+      const next = {
+        ...current,
+        ...(metadata || {}),
+        count: Number(current.count || 0) + 1,
+        last_recorded_at: new Date().toISOString(),
+      }
 
-    if (!row) {
-      return await this.createPayPalMetrics({
-        name,
-        data: next,
-      })
-    }
+      if (!row) {
+        try {
+          return await this.createPayPalMetrics({ name, data: next })
+        } catch {
+          const retry = await this.listPayPalMetrics({ name })
+          const retryRow = retry?.[0]
+          if (retryRow) {
+            const retryData = (retryRow.data || {}) as Record<string, any>
+            return await this.updatePayPalMetrics({
+              id: retryRow.id,
+              name,
+              data: {
+                ...retryData,
+                ...(metadata || {}),
+                count: Number(retryData.count || 0) + 1,
+                last_recorded_at: new Date().toISOString(),
+              },
+            })
+          }
+          throw new Error(`Failed to record metric "${name}"`)
+        }
+      }
 
-    return await this.updatePayPalMetrics({
-      id: row.id,
-      name,
-      data: next,
-    })
+      return await this.updatePayPalMetrics({ id: row.id, name, data: next })
+    } catch (e: unknown) {
+      console.warn("[PayPal] recordMetric failed:", e instanceof Error ? e.message : e)
+      return null
+    }
   }
 
   async recordPaymentLog(eventType: string, metadata?: Record<string, unknown>) {
