@@ -26,12 +26,28 @@ export declare function extractIdentifiers(resource: Record<string, any>, eventT
  * be determined.
  */
 export declare function isPartialRefund(resource: Record<string, any>, sessionData: Record<string, any>): boolean;
+/**
+ * Whether the webhook processor may complete a paid-but-unfinalized cart.
+ *
+ * The storefront's `/store/paypal-complete` call is the primary completion
+ * path, but it only runs in the buyer's browser. If the tab closes, crashes,
+ * or reloads between the capture and that call, the money is captured and no
+ * Medusa order is ever created. The PAYMENT.CAPTURE.COMPLETED webhook is the
+ * server-side safety net for exactly that gap.
+ *
+ * Enabled by default (completing a cart whose payment settled is the correct
+ * outcome); set PAYPAL_WEBHOOK_COMPLETE_CART=false to disable.
+ */
+export declare function isWebhookCartCompletionEnabled(envValue?: string | undefined): boolean;
+/** Events that prove settled funds and may therefore complete the cart. */
+export declare function isCartCompletingEventType(eventType: string): boolean;
 export interface ProcessResult {
     orderId: string | null;
     captureId: string | null;
     refundId: string | null;
     cartId: string | null;
     sessionUpdated: boolean;
+    cartCompleted: boolean;
 }
 export declare function processPayPalWebhookEvent(container: MedusaContainer, input: {
     eventType: string;

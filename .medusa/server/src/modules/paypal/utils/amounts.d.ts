@@ -1,4 +1,4 @@
-export declare function getCurrencyExponent(currencyCode: string): 0 | 2 | 3;
+export declare function getCurrencyExponent(currencyCode: string): 2 | 0 | 3;
 /**
  * Coerce a Medusa monetary amount into a plain JS number.
  *

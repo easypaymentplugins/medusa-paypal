@@ -8,10 +8,19 @@ exports.default = (0, http_1.defineMiddlewares)({
             // Keep the exact bytes PayPal signed (`req.rawBody`) so webhook signature
             // verification hashes the original payload, not a re-serialized copy. This
             // entry must precede the "/store/paypal/:path*" catch-all below.
+            // Rate-limited (opt-in, like the store routes): every unauthenticated
+            // POST here costs a DB dedup read plus an outbound PayPal
+            // verify-webhook-signature call, and a flood of garbage requests could
+            // trip the shared circuit breaker for legitimate verifications.
             matcher: "/store/paypal/webhook",
             method: ["POST"],
             bodyParser: { preserveRawBody: true },
-            middlewares: [],
+            middlewares: [
+                (0, rate_limit_1.createRateLimiter)("webhook", {
+                    maxEnvVar: "PAYPAL_WEBHOOK_RATE_LIMIT_MAX",
+                    windowEnvVar: "PAYPAL_WEBHOOK_RATE_LIMIT_WINDOW_MS",
+                }),
+            ],
         },
         {
             // Same raw-body requirement for the /hooks mirror of the webhook route —
@@ -20,7 +29,12 @@ exports.default = (0, http_1.defineMiddlewares)({
             matcher: "/hooks/paypal/webhook",
             method: ["POST"],
             bodyParser: { preserveRawBody: true },
-            middlewares: [],
+            middlewares: [
+                (0, rate_limit_1.createRateLimiter)("webhook-hooks", {
+                    maxEnvVar: "PAYPAL_WEBHOOK_RATE_LIMIT_MAX",
+                    windowEnvVar: "PAYPAL_WEBHOOK_RATE_LIMIT_WINDOW_MS",
+                }),
+            ],
         },
         {
             // Rate-limit the order-creating route: unauthenticated by necessity, so

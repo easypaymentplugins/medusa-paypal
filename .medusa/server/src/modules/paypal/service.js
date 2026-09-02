@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const utils_1 = require("@medusajs/framework/utils");
+const metrics_1 = require("./utils/metrics");
 const paypal_fetch_1 = require("./utils/paypal-fetch");
 const secret_crypto_1 = require("./utils/secret-crypto");
 const paypal_connection_1 = __importDefault(require("./models/paypal_connection"));
@@ -11,6 +12,7 @@ const paypal_metric_1 = __importDefault(require("./models/paypal_metric"));
 const paypal_settings_1 = __importDefault(require("./models/paypal_settings"));
 const paypal_webhook_event_1 = __importDefault(require("./models/paypal_webhook_event"));
 const config_1 = require("./types/config");
+const paypal_auth_1 = require("./utils/paypal-auth");
 const currencies_1 = require("./utils/currencies");
 const SENSITIVE_KEY_RE = /secret|password|client_secret|access_token|refresh_token|authorization|auth_code|api[_-]?key/i;
 /**
@@ -39,6 +41,22 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
 }) {
     cfg = (0, config_1.getPayPalConfig)();
     tokenRefreshPromise = null;
+    // Raw knex connection for the atomic metric upsert; null when the container
+    // doesn't expose it (recordMetric then falls back to the ORM path).
+    pgForMetrics = null;
+    constructor(...args) {
+        // MedusaService's generated constructor signature varies across framework
+        // versions — pass everything through untouched.
+        super(...args);
+        try {
+            const cradle = (args[0] || {});
+            const pg = cradle.__pg_connection__ ?? cradle.pgConnection ?? null;
+            this.pgForMetrics = pg && typeof pg.raw === "function" ? pg : null;
+        }
+        catch {
+            this.pgForMetrics = null;
+        }
+    }
     get bnCode() {
         return this.cfg.bnCode || "MBJTechnolabs_SI_SPB";
     }
@@ -201,7 +219,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
         if (!partnerMerchantId) {
             throw new Error("Missing PayPal partner merchant id configuration.");
         }
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const accessToken = accessTokenOverride ?? await this.getAppAccessToken();
         const resp = await (0, paypal_fetch_1.paypalFetch)(`${baseUrl}/v1/customer/partners/${encodeURIComponent(partnerMerchantId)}/merchant-integrations/${encodeURIComponent(merchantId)}`, {
             method: "GET",
@@ -225,7 +243,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
         return json;
     }
     async getAppAccessTokenForCredentials(env, credentials) {
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const basic = Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString("base64");
         const body = new URLSearchParams();
         body.set("grant_type", "client_credentials");
@@ -256,7 +274,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
         return { accessToken, tokenPayload: json };
     }
     async fetchSellerProfileFromDirectCredentials(env, credentials) {
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const partnerMerchantId = await this.getPartnerMerchantId(env);
         let tokenPayload = null;
         let accessToken = "";
@@ -547,7 +565,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
             }
         }
         await this.saveOnboardCallback({ authCode: input.authCode, sharedId: input.sharedId });
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const { onboarding } = await this.ensureSettingsDefaults();
         const sellerNonce = (onboarding.seller_nonce || "").trim();
         if (!sellerNonce) {
@@ -807,7 +825,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
         if (!newUrl || !legacyUrl || this.isLocalWebhookUrl(newUrl))
             return;
         const accessToken = await this.getAppAccessToken();
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const getResp = await (0, paypal_fetch_1.paypalFetch)(`${baseUrl}/v1/notifications/webhooks/${encodeURIComponent(webhookId)}`, {
             headers: {
                 Authorization: `Bearer ${accessToken}`,
@@ -857,7 +875,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
             return webhookIds[env];
         }
         const accessToken = await this.getAppAccessToken();
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const webhookUrl = await this.resolveWebhookUrl();
         if (this.isLocalWebhookUrl(webhookUrl)) {
             await this.recordAuditEvent("webhook_skipped_localhost", {
@@ -1064,7 +1082,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
     async refreshAccessToken(row) {
         const env = await this.getCurrentEnvironment();
         const creds = await this.getActiveCredentials();
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const basic = Buffer.from(`${creds.client_id}:${creds.client_secret}`).toString("base64");
         const body = new URLSearchParams();
         body.set("grant_type", "client_credentials");
@@ -1096,7 +1114,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
     }
     async generateClientToken(opts) {
         const env = await this.getCurrentEnvironment();
-        const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+        const baseUrl = (0, paypal_auth_1.getPayPalApiBase)(env);
         const accessToken = await this.getAppAccessToken();
         const res = await (0, paypal_fetch_1.paypalFetch)(`${baseUrl}/v1/identity/generate-token`, {
             method: "POST",
@@ -1119,7 +1137,11 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
         return token;
     }
     async getSettings() {
-        const rows = await this.listPayPalSettings({}, { take: 1 });
+        // Deterministic singleton read: always the OLDEST row. If a first-boot race
+        // ever created a duplicate settings row, every reader (here and the
+        // credential resolver's raw read) must agree on the same winner — ordering
+        // by created_at ASC guarantees that; an unordered `take: 1` does not.
+        const rows = await this.listPayPalSettings({}, { take: 1, order: { created_at: "ASC" } });
         const row = rows?.[0];
         return { data: (row?.data || {}) };
     }
@@ -1143,12 +1165,24 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
         return result;
     }
     async saveSettings(patch) {
-        const rows = await this.listPayPalSettings({}, { take: 1 });
+        // Same deterministic ordering as getSettings so reads and writes always
+        // target the same singleton row.
+        const rows = await this.listPayPalSettings({}, { take: 1, order: { created_at: "ASC" } });
         const row = rows?.[0];
         const current = (row?.data || {});
         const next = this.deepMerge(current, patch);
         if (!row) {
             const created = await this.createPayPalSettings({ data: next });
+            // First-boot race guard: if a concurrent save created a row a moment
+            // earlier, the ASC ordering means that row is the canonical singleton —
+            // merge this patch into it instead of leaving a divergent duplicate.
+            const recheck = await this.listPayPalSettings({}, { take: 1, order: { created_at: "ASC" } });
+            const canonical = recheck?.[0];
+            if (canonical && canonical.id !== created.id) {
+                const merged = this.deepMerge((canonical.data || {}), patch);
+                await this.updatePayPalSettings({ id: canonical.id, data: merged });
+                return { data: merged };
+            }
             return { data: (created.data || {}) };
         }
         await this.updatePayPalSettings({ id: row.id, data: next });
@@ -1176,9 +1210,7 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
             throw new Error("PayPal orderId is required");
         }
         const env = await this.getCurrentEnvironment();
-        const base = env === "live"
-            ? "https://api-m.paypal.com"
-            : "https://api-m.sandbox.paypal.com";
+        const base = (0, paypal_auth_1.getPayPalApiBase)(env);
         const accessToken = await this.getAppAccessToken();
         const resp = await (0, paypal_fetch_1.paypalFetch)(`${base}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
             method: "GET",
@@ -1260,6 +1292,15 @@ class PayPalModuleService extends (0, utils_1.MedusaService)({
         return null;
     }
     async recordMetric(name, metadata) {
+        // Preferred path: single atomic INSERT ... ON CONFLICT (same statement the
+        // credential resolver uses), so concurrent routes/webhooks never lose
+        // increments to a read-modify-write race.
+        if (this.pgForMetrics) {
+            await (0, metrics_1.recordMetricAtomic)(this.pgForMetrics, name, metadata);
+            return null;
+        }
+        // Fallback (container without a raw pg connection): the previous ORM
+        // read-modify-write. Best-effort only — never throws.
         try {
             const existing = await this.listPayPalMetrics({ name });
             const row = existing?.[0];

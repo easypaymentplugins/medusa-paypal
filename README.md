@@ -1,6 +1,6 @@
 # PayPal for Medusa
 
-**Accept PayPal and advanced credit card payments in your Medusa v2 store — built by an official PayPal Partner.**
+**Accept PayPal and credit card payments in your Medusa v2 store — built by an official PayPal Partner.**
 
 [![npm version](https://img.shields.io/npm/v/@easypayment/medusa-payment-paypal?color=blue&label=npm)](https://www.npmjs.com/package/@easypayment/medusa-payment-paypal)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -9,32 +9,16 @@
 
 ---
 
-## 📋 Table of Contents
-
-- [📦 What's included](#-whats-included)
-- [✅ Requirements](#-requirements)
-- [🚀 Installation](#-installation)
-- [⚙️ Setup](#%EF%B8%8F-setup)
-  - [Step 1 — Configure medusa-config.ts](#step-1--configure-medusa-configts)
-  - [Step 2 — Run database migrations](#step-2--run-database-migrations)
-  - [Step 3 — Connect your PayPal account](#step-3--connect-your-paypal-account)
-  - [Step 4 — Enable providers in your region](#step-4--enable-providers-in-your-region)
-  - [Step 5 — Configure settings](#step-5--configure-settings-optional)
-  - [Step 6 — Add PayPal to your storefront](#step-6--add-paypal-to-your-storefront)
-- [📄 License](#-license)
-
----
-
-## 📦 What's included
+## ✨ What you get
 
 | Feature | Details |
 |---|---|
-| 🔵 **PayPal Smart Buttons** | One-click wallet checkout via PayPal |
-| 💳 **Advanced Card Fields** | Hosted, PCI-compliant advanced credit card inputs |
-| 🛠 **Admin Dashboard** | Connect, configure, and switch environments from Medusa Admin |
-| 🌍 **Sandbox & Live** | Toggle between test and production without restarting |
-| ⚡ **Webhooks** | Automatically registered and verified with built-in retry support |
-| 🔐 **3D Secure** | Configurable SCA/3DS per transaction |
+| 🔵 **PayPal Buttons** | One-click PayPal checkout for your customers |
+| 💳 **Card Payments** | Secure credit & debit card fields, hosted by PayPal (PCI compliant) |
+| 🛠 **Admin Dashboard** | Connect your PayPal account and manage everything from Medusa Admin |
+| 🌍 **Test & Live modes** | Try everything safely in Sandbox before going live |
+| 🔐 **3D Secure** | Extra card security, configurable in one click |
+| 🔄 **Reliable by design** | Payments are verified with PayPal at every step — webhooks, retries, and safety nets are handled for you |
 
 ---
 
@@ -48,7 +32,7 @@
 
 ## 🚀 Installation
 
-**In your Medusa backend directory**, run:
+In your Medusa backend folder, run:
 
 ```bash
 npm install @easypayment/medusa-payment-paypal
@@ -56,11 +40,9 @@ npm install @easypayment/medusa-payment-paypal
 
 ---
 
-## ⚙️ Setup
+## ⚙️ Setup — 5 steps
 
-### Step 1 — Configure `medusa-config.ts`
-
-Add the plugin and both payment providers to your existing `medusa-config.ts`:
+### 1. Add the plugin to `medusa-config.ts`
 
 ```ts
 import { loadEnv, defineConfig } from "@medusajs/framework/utils"
@@ -92,14 +74,14 @@ export default defineConfig({
       options: {
         providers: [
           {
-            // PayPal Smart Buttons (wallet checkout)
+            // PayPal Buttons
             resolve: "@easypayment/medusa-payment-paypal/providers/paypal",
             id: "paypal",
             options: {},
             dependencies: ["paypal_onboarding"],
           },
           {
-            // Advanced Card Fields (hosted card inputs)
+            // Card payments
             resolve: "@easypayment/medusa-payment-paypal/providers/paypal_card",
             id: "paypal_card",
             options: {},
@@ -112,70 +94,79 @@ export default defineConfig({
 })
 ```
 
----
-
-### Step 2 — Run database migrations
+### 2. Run database migrations
 
 ```bash
 npx medusa db:migrate
 ```
 
----
-
-### Step 3 — Connect your PayPal account
+### 3. Connect your PayPal account
 
 1. Start your Medusa server
-2. Open **Medusa Admin → Settings → PayPal → PayPal Connection**
-3. Choose **Sandbox** (testing) or **Live** (production)
-4. Click **Connect to PayPal** and complete the onboarding flow
+2. Open **Medusa Admin → Settings → PayPal**
+3. Choose **Sandbox** (testing) or **Live** (real payments)
+4. Click **Connect to PayPal** and follow the steps
 
-Credentials are saved automatically. Prefer manual setup? Click **Insert credentials manually** and paste your Client ID and Secret from [developer.paypal.com](https://developer.paypal.com/dashboard/).
+That's it — your credentials are saved automatically. Webhooks are registered for you too.
 
-> **🔐 Encrypt secrets at rest (recommended for production).** Set `PAYPAL_ENCRYPTION_KEY` to any strong random string. The seller client secret and PayPal app access token are then stored AES‑256‑GCM‑encrypted in the database; without it they are stored in plaintext (the previous default). Encryption is transparent — existing plaintext credentials keep working and are upgraded to ciphertext the next time they are saved/refreshed.
->
-> Keep this key safe and backed up: **if it is lost, stored credentials cannot be decrypted** and you must reconnect PayPal. Rotating the key requires re‑saving credentials.
+> 💡 Prefer manual setup? Click **Insert credentials manually** and paste your Client ID and Secret from [developer.paypal.com](https://developer.paypal.com/dashboard/).
 
----
+### 4. Turn PayPal on in your region
 
-### Step 4 — Enable providers in your region
+Go to **Medusa Admin → Settings → Regions → your region** and enable:
 
-1. Go to **Medusa Admin → Settings → Regions → [your region]**
-2. Under **Payment Providers**, enable:
-
-| Provider ID | Description |
+| Payment provider | What it is |
 |---|---|
-| `pp_paypal_paypal` | PayPal Smart Buttons (wallet) |
-| `pp_paypal_card_paypal_card` | Advanced Card Fields (card) |
+| `pp_paypal_paypal` | PayPal Buttons |
+| `pp_paypal_card_paypal_card` | Card payments |
+
+### 5. Add PayPal to your storefront
+
+The checkout UI comes as a separate package — install it in your **storefront** project:
+
+📦 **[@easypayment/medusa-paypal-ui](https://www.npmjs.com/package/@easypayment/medusa-paypal-ui)** — ready-made PayPal components for Next.js storefronts, with a step-by-step guide.
 
 ---
 
-### Step 5 — Configure settings *(optional)*
+## 🎨 Customize (optional)
 
-All settings live in **Medusa Admin → Settings → PayPal** and apply immediately — no server restart needed.
+Everything is managed in **Medusa Admin → Settings → PayPal** — changes apply instantly, no restart needed:
 
-| Tab | What you can configure |
-|---|---|
-| **PayPal Settings** | Enable/disable, button color, shape, label |
-| **Advanced Card Payments** | Enable/disable, 3D Secure mode |
-| **Additional Settings** | Payment action (capture / authorize), brand name, invoice prefix |
+- **PayPal Settings** — turn PayPal on/off, button color, shape, and label
+- **Advanced Card Payments** — turn card payments on/off, 3D Secure mode
+- **Additional Settings** — capture vs. authorize, brand name shown at PayPal, invoice prefix
 
 ---
 
-### Step 6 — Add PayPal to your storefront
+## 🔐 Going live — two things we recommend
 
-The checkout UI is shipped as a separate package — **install it inside your storefront project**, not in this backend.
+1. **`PAYPAL_ENCRYPTION_KEY`** — set this to any long random text in your server's environment. Your PayPal credentials are then stored encrypted in the database. Keep the key safe: if it's lost, just reconnect PayPal.
+2. **`MEDUSA_BACKEND_URL`** — set this to your backend's public address (e.g. `https://api.mystore.com`) so PayPal can reach your store for payment notifications.
 
-📦 **[@easypayment/medusa-paypal-ui](https://www.npmjs.com/package/@easypayment/medusa-paypal-ui)** — React components, hooks, and a drop-in payment step adapter for Next.js App Router storefronts.
+<details>
+<summary><b>Advanced options</b> (for developers — everything works without these)</summary>
 
-See the [storefront integration & testing guide →](https://www.npmjs.com/package/@easypayment/medusa-paypal-ui)
+<br>
 
----
+| Variable | Default | What it does |
+|---|---|---|
+| `STOREFRONT_URL` | *(unset)* | Storefront address used for PayPal return/cancel pages (can also be set in Admin) |
+| `PAYPAL_ENCRYPTION_STRICT` | `false` | `true` = refuse to save credentials unencrypted |
+| `PAYPAL_SELLER_NONCE` | *(auto)* | Set a fixed random string when running multiple server instances |
+| `PAYPAL_ADMIN_ORIGIN` | first `ADMIN_CORS` entry | Restricts the onboarding popup to your admin URL |
+| `PAYPAL_WEBHOOK_COMPLETE_CART` | `true` | Safety net that finishes an order when the payment succeeded but the buyer's browser closed. `false` disables it |
+| `PAYPAL_RATE_LIMIT_MAX` / `PAYPAL_RATE_LIMIT_WINDOW_MS` | *(off)* / `60000` | Optional request limit for the public checkout routes |
+| `PAYPAL_WEBHOOK_RATE_LIMIT_MAX` / `PAYPAL_WEBHOOK_RATE_LIMIT_WINDOW_MS` | *(off)* / `60000` | Optional request limit for the webhook endpoint (separate from the above) |
+| `PAYPAL_WEBHOOK_REPLAY_WINDOW_MINUTES` | `60` | Rejects webhook deliveries older than this |
+| `PAYPAL_WEBHOOK_STALE_PROCESSING_MS` | `300000` | When the retry job re-picks-up interrupted webhook events |
+| `PAYPAL_WEBHOOK_ID_LIVE` / `PAYPAL_WEBHOOK_ID_SANDBOX` | *(auto)* | Manual webhook-id override (normally automatic) |
+| `PAYPAL_HTTP_TIMEOUT_MS` | `30000` | Timeout for calls to PayPal |
+| `PAYPAL_CURRENCY` | `EUR` | Fallback currency if none is configured |
+| `PAYPAL_ALERT_WEBHOOK_URLS` | *(unset)* | Comma-separated URLs that receive operational alert notifications |
 
-## 📊 Observability
+**Monitoring:** operational counters live in the `paypal_metric` table; every webhook is recorded in `paypal_webhook_event` with automatic retries; audit events are logged as JSON lines tagged `"log":"paypal_audit"` (secrets redacted).
 
-- **Metrics** — operational counters (e.g. `create_order_success`, `capture_order_failed`, `webhook_success`, `webhook_dead_letter`) are persisted in the `paypal_metric` table.
-- **Audit trail** — security/lifecycle events (credential changes, environment switches, webhook registration, capture/refund failures, alerts) are emitted as structured JSON log lines tagged `"log":"paypal_audit"`. In production, ship stdout to your log aggregator and filter on that tag. Sensitive fields (secrets, tokens) are redacted before logging.
-- **Webhooks** — every received event is recorded in `paypal_webhook_event` with status (`processed` / `failed` / `dead_letter` / `ignored`), attempt count, and last error; failures are retried by the `paypal-webhook-retry` job.
+</details>
 
 ---
 

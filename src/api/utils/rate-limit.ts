@@ -36,8 +36,8 @@ function readEnvInt(name: string, fallback: number): number {
 }
 
 /** The configured max, or null when rate limiting is disabled (opt-in). */
-function readConfiguredMax(): number | null {
-  const raw = process.env.PAYPAL_RATE_LIMIT_MAX
+function readConfiguredMax(envVar: string): number | null {
+  const raw = process.env[envVar]
   if (raw === undefined || raw === "") return null
   const v = Number(raw)
   return Number.isFinite(v) && v > 0 ? v : null
@@ -62,8 +62,23 @@ function clientKey(req: MedusaRequest): string {
   return ip
 }
 
-export function createRateLimiter(scope: string) {
+export type RateLimiterOptions = {
+  /**
+   * Env var holding the request cap for this limiter. Defaults to the shared
+   * PAYPAL_RATE_LIMIT_MAX. The webhook routes pass their own dedicated var:
+   * PayPal delivers from a handful of egress IPs, so a cap sized for
+   * individual buyers would throttle legitimate webhook bursts (a sale spike)
+   * into 429-driven redelivery loops.
+   */
+  maxEnvVar?: string
+  /** Env var for the window; defaults to PAYPAL_RATE_LIMIT_WINDOW_MS. */
+  windowEnvVar?: string
+}
+
+export function createRateLimiter(scope: string, options: RateLimiterOptions = {}) {
   const buckets = new Map<string, Bucket>()
+  const maxEnvVar = options.maxEnvVar || "PAYPAL_RATE_LIMIT_MAX"
+  const windowEnvVar = options.windowEnvVar || "PAYPAL_RATE_LIMIT_WINDOW_MS"
 
   return function rateLimit(
     req: MedusaRequest,
@@ -72,11 +87,11 @@ export function createRateLimiter(scope: string) {
   ) {
     // Opt-in: with no configured max, this middleware is a pass-through so
     // existing deployments (especially behind a shared-IP proxy) are unaffected.
-    const max = readConfiguredMax()
+    const max = readConfiguredMax(maxEnvVar)
     if (max === null) {
       return next()
     }
-    const windowMs = readEnvInt("PAYPAL_RATE_LIMIT_WINDOW_MS", DEFAULT_WINDOW_MS)
+    const windowMs = readEnvInt(windowEnvVar, DEFAULT_WINDOW_MS)
     const now = Date.now()
     const key = `${scope}:${clientKey(req)}`
 

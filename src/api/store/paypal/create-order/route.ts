@@ -8,6 +8,7 @@ import {
   normalizeCurrencyCode,
 } from "../../../../modules/paypal/utils/currencies"
 import { getPayPalApiBase } from "../../../../modules/paypal/utils/paypal-auth"
+import { PAYPAL_PARTNER_ATTRIBUTION_ID as BN_CODE } from "../../../../modules/paypal/utils/partner"
 import { paypalFetch } from "../../../../modules/paypal/utils/paypal-fetch"
 import type PayPalModuleService from "../../../../modules/paypal/service"
 import {
@@ -15,8 +16,6 @@ import {
   getStoredPayPalOrderId,
   updatePayPalSessionData,
 } from "../../../../modules/paypal/utils/payment-session"
-
-const BN_CODE = "MBJTechnolabs_SI_SPB"
 
 type Body = {
   cart_id: string
@@ -431,13 +430,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     const base = getPayPalApiBase(creds.environment)
     const accessToken = await paypal.getAppAccessToken()
 
-    // Deterministic-per-cart idempotency key for the PayPal call. Kept distinct
-    // from `requestId` (the log/response correlation id declared at the top of
-    // POST) so the two never shadow each other.
+    // Deterministic-per-(cart, amount, currency) idempotency key for the PayPal
+    // call. The amount/currency MUST be part of the key: PayPal replays the
+    // cached response for a reused PayPal-Request-Id, so a key derived from the
+    // cart id alone would return the ORIGINAL order (at the original total)
+    // when the buyer changes the cart and a fresh order is minted — silently
+    // re-charging the stale amount and defeating the staleness check above.
+    // Kept distinct from `requestId` (the log/response correlation id declared
+    // at the top of POST) so the two never shadow each other.
     const paypalRequestId = resolveIdempotencyKey(
       req,
-      `create-order-${cart.id}`,
-      `pp-create-${cart.id}`
+      `create-order-${cart.id}-${value}-${currency}`,
+      `pp-create-${cart.id}-${value}-${currency}`
     )
 
     const ppResp = await paypalFetch(`${base}/v2/checkout/orders`, {

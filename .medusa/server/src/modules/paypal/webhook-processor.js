@@ -10,8 +10,11 @@ exports.normalizeEventVersion = normalizeEventVersion;
 exports.extractCaptureIdFromLinks = extractCaptureIdFromLinks;
 exports.extractIdentifiers = extractIdentifiers;
 exports.isPartialRefund = isPartialRefund;
+exports.isWebhookCartCompletionEnabled = isWebhookCartCompletionEnabled;
+exports.isCartCompletingEventType = isCartCompletingEventType;
 exports.processPayPalWebhookEvent = processPayPalWebhookEvent;
 const utils_1 = require("@medusajs/framework/utils");
+const core_workflow_1 = require("./utils/core-workflow");
 const provider_ids_1 = require("./utils/provider-ids");
 exports.EVENT_STATUS_MAP = {
     "CHECKOUT.ORDER.APPROVED": "authorized",
@@ -260,6 +263,61 @@ function isPartialRefund(resource, sessionData) {
     // PayPal or the session's stored major-unit amount.
     return refunded + 0.005 < captured;
 }
+/**
+ * Whether the webhook processor may complete a paid-but-unfinalized cart.
+ *
+ * The storefront's `/store/paypal-complete` call is the primary completion
+ * path, but it only runs in the buyer's browser. If the tab closes, crashes,
+ * or reloads between the capture and that call, the money is captured and no
+ * Medusa order is ever created. The PAYMENT.CAPTURE.COMPLETED webhook is the
+ * server-side safety net for exactly that gap.
+ *
+ * Enabled by default (completing a cart whose payment settled is the correct
+ * outcome); set PAYPAL_WEBHOOK_COMPLETE_CART=false to disable.
+ */
+function isWebhookCartCompletionEnabled(envValue = process.env.PAYPAL_WEBHOOK_COMPLETE_CART) {
+    const v = String(envValue ?? "").trim().toLowerCase();
+    return !(v === "false" || v === "0" || v === "off" || v === "no");
+}
+/** Events that prove settled funds and may therefore complete the cart. */
+function isCartCompletingEventType(eventType) {
+    return eventType === "PAYMENT.CAPTURE.COMPLETED";
+}
+/**
+ * Complete the cart if (and only if) it is still incomplete. Returns true when
+ * this call completed it. Racing the storefront's own completion is expected
+ * and safe: on a workflow error the cart is re-checked, and "someone else
+ * completed it first" counts as success. A genuine failure is re-thrown so the
+ * webhook retry schedule (and ultimately the dead-letter queue) keeps the
+ * paid-but-unfinalized cart visible instead of silently dropping it.
+ */
+async function completeCartIfPending(container, cartId, eventType) {
+    const query = container.resolve("query");
+    const { data } = await query.graph({
+        entity: "cart",
+        fields: ["id", "completed_at"],
+        filters: { id: cartId },
+    });
+    const cart = data?.[0];
+    if (!cart || cart.completed_at)
+        return false;
+    try {
+        const { result } = await (0, core_workflow_1.runCoreWorkflow)(container, "complete-cart", { id: cartId });
+        console.info(`[PayPal] webhook: completed cart ${cartId} from ${eventType} (order_id=${result?.id ?? "n/a"})`);
+        return true;
+    }
+    catch (e) {
+        const recheck = await query
+            .graph({ entity: "cart", fields: ["id", "completed_at"], filters: { id: cartId } })
+            .catch(() => ({ data: [] }));
+        if (recheck?.data?.[0]?.completed_at) {
+            // The storefront (or a concurrent webhook) won the race — that's success.
+            return false;
+        }
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`webhook cart completion failed for ${cartId}: ${msg}`);
+    }
+}
 async function processPayPalWebhookEvent(container, input) {
     const resource = normalizeResource(input.payload);
     const { orderId, captureId, refundId, cartId: rawCartId } = extractIdentifiers(resource, input.eventType);
@@ -268,7 +326,14 @@ async function processPayPalWebhookEvent(container, input) {
         undefined;
     const targetStatus = exports.EVENT_STATUS_MAP[input.eventType];
     if (!targetStatus) {
-        return { orderId, captureId, refundId, cartId: rawCartId, sessionUpdated: false };
+        return {
+            orderId,
+            captureId,
+            refundId,
+            cartId: rawCartId,
+            sessionUpdated: false,
+            cartCompleted: false,
+        };
     }
     let cartId = rawCartId;
     if (!cartId && (orderId || captureId)) {
@@ -309,9 +374,16 @@ async function processPayPalWebhookEvent(container, input) {
         }
     }
     let sessionUpdated = false;
+    let cartCompleted = false;
+    let sessionEligibleForCompletion = false;
     if (cartId) {
         const resolved = await findPayPalSession(container, cartId);
         if (resolved) {
+            // A canceled session must never complete a cart; anything that is (or
+            // may legally become) captured can.
+            sessionEligibleForCompletion =
+                resolved.sessionStatus === "captured" ||
+                    isTransitionAllowed(resolved.sessionStatus, "captured");
             const refundEntry = refundId
                 ? [
                     {
@@ -357,6 +429,17 @@ async function processPayPalWebhookEvent(container, input) {
     else {
         console.warn(`[PayPal] webhook: could not resolve cartId for event ${input.eventType}`, { orderId, captureId, refundId });
     }
-    return { orderId, captureId, refundId, cartId, sessionUpdated };
+    // Server-side safety net: the funds settled but the buyer's browser may
+    // never call /store/paypal-complete (closed tab, crash, mobile redirect
+    // loss). Complete the cart here so a captured payment always produces an
+    // order. Runs after the session update so authorizePayment sees the capture.
+    if (cartId &&
+        sessionUpdated &&
+        sessionEligibleForCompletion &&
+        isCartCompletingEventType(input.eventType) &&
+        isWebhookCartCompletionEnabled()) {
+        cartCompleted = await completeCartIfPending(container, cartId, input.eventType);
+    }
+    return { orderId, captureId, refundId, cartId, sessionUpdated, cartCompleted };
 }
 //# sourceMappingURL=webhook-processor.js.map

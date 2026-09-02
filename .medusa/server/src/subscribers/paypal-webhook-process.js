@@ -69,7 +69,11 @@ async function paypalWebhookProcessHandler({ event, container, }) {
             refund_id: processed.refundId,
             cart_id: processed.cartId,
             session_updated: processed.sessionUpdated,
+            cart_completed: processed.cartCompleted,
         });
+        if (processed.cartCompleted) {
+            await paypal.recordMetric("webhook_cart_completed").catch(() => { });
+        }
         await paypal.recordMetric("webhook_success").catch(() => { });
     }
     catch (e) {

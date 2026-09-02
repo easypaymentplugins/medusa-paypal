@@ -4,10 +4,10 @@ exports.POST = POST;
 const utils_1 = require("@medusajs/framework/utils");
 const crypto_1 = require("crypto");
 const paypal_auth_1 = require("../../../../modules/paypal/utils/paypal-auth");
+const partner_1 = require("../../../../modules/paypal/utils/partner");
 const paypal_fetch_1 = require("../../../../modules/paypal/utils/paypal-fetch");
 const status_utils_1 = require("../../../../modules/paypal/payment-provider/status-utils");
 const payment_session_1 = require("../../../../modules/paypal/utils/payment-session");
-const BN_CODE = "MBJTechnolabs_SI_SPB";
 const PAYPAL_ORDER_ID_RE = /^[A-Z0-9]{10,25}$/;
 function resolveIdempotencyKey(req, suffix, fallback) {
     const header = req.headers["idempotency-key"] ||
@@ -74,7 +74,24 @@ async function attachPayPalAuthorizationToSession(cartId, orderId, authorization
         return false;
     }
 }
-async function getExistingCapture(cartId, orderId, scope) {
+/**
+ * Return the session's existing capture ONLY when it demonstrably COMPLETED.
+ *
+ * The session can carry a capture that never settled: the webhook processor
+ * patches `capture_id` onto the session for every capture event, including
+ * PAYMENT.CAPTURE.DENIED and PENDING. Blindly short-circuiting on any stored
+ * capture would report success to the storefront for a payment that was
+ * declined — the buyer would then hit "payment processed but order could not
+ * be finalized" instead of being able to retry.
+ *
+ * - stored capture object with a known status: COMPLETED → return it,
+ *   anything else → null (fall through and attempt a real capture).
+ * - bare `capture_id` (or a capture object whose status can't be read):
+ *   verify against the live PayPal order. If PayPal can't be reached, return
+ *   the stored data — the previous fail-safe behavior — since attempting a
+ *   fresh capture against an unreachable PayPal would fail anyway.
+ */
+async function getExistingCompletedCapture(cartId, orderId, scope, fetchLiveOrder) {
     try {
         const session = await (0, payment_session_1.findPayPalSessionForCart)(cartId, scope);
         if (!session)
@@ -83,10 +100,28 @@ async function getExistingCapture(cartId, orderId, scope) {
         const existingOrderId = String(paypalData.order_id || "");
         if (existingOrderId && existingOrderId !== orderId)
             return null;
-        if (paypalData.capture)
-            return paypalData.capture;
-        if (paypalData.capture_id)
-            return { id: paypalData.capture_id };
+        const stored = paypalData.capture;
+        if (stored) {
+            const storedStatus = (0, status_utils_1.extractCaptureStatus)(stored);
+            if (storedStatus === "COMPLETED")
+                return stored;
+            if (storedStatus)
+                return null;
+            // no readable status on the stored object — verify live below
+        }
+        if (!stored && !paypalData.capture_id)
+            return null;
+        let order;
+        try {
+            order = await fetchLiveOrder();
+        }
+        catch {
+            return stored || { id: paypalData.capture_id };
+        }
+        const liveCapture = order?.purchase_units?.[0]?.payments?.captures?.[0];
+        if (liveCapture && (0, status_utils_1.extractCaptureStatus)(liveCapture) === "COMPLETED") {
+            return liveCapture;
+        }
         return null;
     }
     catch {
@@ -128,15 +163,28 @@ async function POST(req, res) {
                 message: "order_id does not match the payment session for this cart",
             });
         }
-        const existingCapture = await getExistingCapture(cartId, orderId, scope);
-        if (existingCapture) {
-            return res.json({ capture: existingCapture });
-        }
         const creds = await paypal.getActiveCredentials();
         // Cached app access token (single-flight refresh) — avoids an OAuth
         // round-trip on every capture-order call.
         const base = (0, paypal_auth_1.getPayPalApiBase)(creds.environment);
         const accessToken = await paypal.getAppAccessToken();
+        const fetchLiveOrder = async () => {
+            const resp = await (0, paypal_fetch_1.paypalFetch)(`${base}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
+                method: "GET",
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    "Content-Type": "application/json",
+                },
+            });
+            if (!resp.ok) {
+                throw new Error(`PayPal get order error (${resp.status})`);
+            }
+            return resp.json();
+        };
+        const existingCapture = await getExistingCompletedCapture(cartId, orderId, scope, fetchLiveOrder);
+        if (existingCapture) {
+            return res.json({ capture: existingCapture });
+        }
         const settings = await paypal.getSettings().catch(() => ({}));
         const data = settings && typeof settings === "object" && "data" in settings
             ? (settings.data ?? {})
@@ -145,7 +193,12 @@ async function POST(req, res) {
         const paymentAction = typeof additionalSettings.paymentAction === "string"
             ? additionalSettings.paymentAction
             : "capture";
-        const requestId = resolveIdempotencyKey(req, "capture-order", `pp-capture-${orderId}`);
+        // The suffix must include the order id: PayPal deduplicates by
+        // PayPal-Request-Id, so a client reusing one Idempotency-Key header across
+        // two different orders would otherwise get order A's cached capture back
+        // for order B. Named `paypalRequestId` so it never shadows `requestId`
+        // (the log/response correlation UUID declared at the top of POST).
+        const paypalRequestId = resolveIdempotencyKey(req, `capture-order-${orderId}`, `pp-capture-${orderId}`);
         const safeOrderId = encodeURIComponent(orderId);
         const endpoint = paymentAction === "authorize"
             ? `${base}/v2/checkout/orders/${safeOrderId}/authorize`
@@ -155,8 +208,8 @@ async function POST(req, res) {
             headers: {
                 Authorization: `Bearer ${accessToken}`,
                 "Content-Type": "application/json",
-                "PayPal-Request-Id": requestId,
-                "PayPal-Partner-Attribution-Id": BN_CODE,
+                "PayPal-Request-Id": paypalRequestId,
+                "PayPal-Partner-Attribution-Id": partner_1.PAYPAL_PARTNER_ATTRIBUTION_ID,
             },
         });
         const ppText = await ppResp.text();

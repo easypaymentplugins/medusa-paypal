@@ -43,6 +43,8 @@ declare const PayPalModuleService_base: import("@medusajs/framework/utils").Medu
 declare class PayPalModuleService extends PayPalModuleService_base {
     protected cfg: import("./types/config").PayPalModuleConfig;
     private tokenRefreshPromise;
+    private pgForMetrics;
+    constructor(...args: any[]);
     private get bnCode();
     private getSettingsData;
     private ensureSettingsDefaults;

@@ -1,7 +1,8 @@
+import { recordMetricAtomic } from "./metrics"
+import { PAYPAL_PARTNER_ATTRIBUTION_ID as BN_CODE } from "./partner"
 import { paypalFetch } from "./paypal-fetch"
 import { decryptSecret, encryptSecret } from "./secret-crypto"
 
-const BN_CODE = "MBJTechnolabs_SI_SPB"
 const TOKEN_MARGIN_MS = 2 * 60 * 1000
 
 type Environment = "sandbox" | "live"
@@ -214,9 +215,13 @@ export class PayPalCredentialResolver {
 
   async getSettings(): Promise<ResolvedSettings> {
     try {
+      // Deterministic singleton read (oldest row wins) — must match the module
+      // service's getSettings ordering so both containers agree on the same
+      // row even if a first-boot race ever created a duplicate.
       const rows = await this.db("paypal_settings")
         .select("data")
         .whereNull("deleted_at")
+        .orderBy("created_at", "asc")
         .limit(1)
 
       const data = (rows?.[0]?.data || {}) as Record<string, any>
@@ -259,40 +264,8 @@ export class PayPalCredentialResolver {
   }
 
   async recordMetric(name: string, metadata?: Record<string, unknown>) {
-    try {
-      const id = `ppmet_${Date.now().toString(36)}${Math.random()
-        .toString(36)
-        .slice(2, 8)}`
-      const nowIso = new Date().toISOString()
-      const metaJson = JSON.stringify(metadata || {})
-
-      // Atomic upsert so concurrent captures/refunds don't lose metric updates
-      // via a read-modify-write race. The `count` increment happens inside a
-      // single statement (not read in JS then written back), and the unique
-      // constraint on `name` drives the ON CONFLICT so there is no insert/update
-      // decision to race on either. Any provided metadata is merged first, then
-      // `count`/`last_recorded_at` are applied last so metadata can't clobber
-      // the running count.
-      await this.db.raw(
-        `INSERT INTO paypal_metric (id, name, data, created_at, updated_at)
-         VALUES (
-           ?, ?,
-           (?::jsonb || jsonb_build_object('count', 1, 'last_recorded_at', ?::text)),
-           now(), now()
-         )
-         ON CONFLICT (name) DO UPDATE SET
-           data = paypal_metric.data
-                  || ?::jsonb
-                  || jsonb_build_object(
-                       'count', COALESCE((paypal_metric.data->>'count')::bigint, 0) + 1,
-                       'last_recorded_at', ?::text
-                     ),
-           deleted_at = NULL,
-           updated_at = now()`,
-        [id, name, metaJson, nowIso, metaJson, nowIso]
-      )
-    } catch {
-      // metrics must never break the payment flow
-    }
+    // Atomic upsert (single INSERT ... ON CONFLICT statement) so concurrent
+    // captures/refunds don't lose metric updates via a read-modify-write race.
+    await recordMetricAtomic(this.db, name, metadata)
   }
 }

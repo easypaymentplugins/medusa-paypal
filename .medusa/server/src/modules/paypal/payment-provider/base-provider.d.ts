@@ -20,6 +20,21 @@ export declare abstract class PayPalProviderBase extends AbstractPaymentProvider
     protected abstract readonly idempotencyPrefix: string;
     constructor(cradle: Record<string, any>, options: Options);
     protected static resolvePgConnection(cradle: Record<string, any>): any;
+    /** Serialize an error for audit metadata without losing cause chains. */
+    protected serializeError(error: unknown): {
+        name: string;
+        message: string;
+        stack: string | undefined;
+        cause: unknown;
+    } | {
+        message: string;
+        name?: undefined;
+        stack?: undefined;
+        cause?: undefined;
+    };
+    protected recordFailure(eventType: string, metadata?: Record<string, unknown>): Promise<void>;
+    protected recordSuccess(metricName: string): Promise<void>;
+    protected recordPaymentEvent(eventType: string, metadata?: Record<string, unknown>): Promise<void>;
     protected generateSessionId(): string;
     resolveSettings(): Promise<import("../utils/credential-resolver").ResolvedSettings>;
     protected resolveCurrencyOverride(): Promise<string>;

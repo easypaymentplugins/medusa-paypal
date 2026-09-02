@@ -1,4 +1,5 @@
 import { MedusaService } from "@medusajs/framework/utils"
+import { recordMetricAtomic } from "./utils/metrics"
 import { paypalFetch } from "./utils/paypal-fetch"
 import { decryptSecret, encryptSecret } from "./utils/secret-crypto"
 import PayPalConnection from "./models/paypal_connection"
@@ -6,6 +7,7 @@ import PayPalMetric from "./models/paypal_metric"
 import PayPalSettings from "./models/paypal_settings"
 import PayPalWebhookEvent from "./models/paypal_webhook_event"
 import { getPayPalConfig } from "./types/config"
+import { getPayPalApiBase } from "./utils/paypal-auth"
 import { normalizeCurrencyCode } from "./utils/currencies"
 
 type Environment = "sandbox" | "live"
@@ -47,6 +49,23 @@ class PayPalModuleService extends MedusaService({
 }) {
   protected cfg = getPayPalConfig()
   private tokenRefreshPromise: Promise<string> | null = null
+  // Raw knex connection for the atomic metric upsert; null when the container
+  // doesn't expose it (recordMetric then falls back to the ORM path).
+  private pgForMetrics: { raw: (sql: string, bindings: unknown[]) => Promise<unknown> } | null =
+    null
+
+  constructor(...args: any[]) {
+    // MedusaService's generated constructor signature varies across framework
+    // versions — pass everything through untouched.
+    super(...args)
+    try {
+      const cradle = (args[0] || {}) as Record<string, any>
+      const pg = cradle.__pg_connection__ ?? cradle.pgConnection ?? null
+      this.pgForMetrics = pg && typeof pg.raw === "function" ? pg : null
+    } catch {
+      this.pgForMetrics = null
+    }
+  }
 
   private get bnCode(): string {
     return this.cfg.bnCode || "MBJTechnolabs_SI_SPB"
@@ -244,7 +263,7 @@ class PayPalModuleService extends MedusaService({
       throw new Error("Missing PayPal partner merchant id configuration.")
     }
 
-    const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
     const accessToken = accessTokenOverride ?? await this.getAppAccessToken()
 
     const resp = await paypalFetch(
@@ -282,7 +301,7 @@ class PayPalModuleService extends MedusaService({
     env: Environment,
     credentials: { clientId: string; clientSecret: string }
   ) {
-    const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
     const basic = Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString("base64")
 
     const body = new URLSearchParams()
@@ -322,7 +341,7 @@ class PayPalModuleService extends MedusaService({
     env: Environment,
     credentials?: { clientId: string; clientSecret: string }
   ): Promise<{ sellerMerchantId: string | null; sellerEmail: string | null }> {
-    const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
     const partnerMerchantId = await this.getPartnerMerchantId(env)
     let tokenPayload: Record<string, any> | null = null
 
@@ -679,7 +698,7 @@ class PayPalModuleService extends MedusaService({
     }
 
     await this.saveOnboardCallback({ authCode: input.authCode, sharedId: input.sharedId })
-    const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
 
     const { onboarding } = await this.ensureSettingsDefaults()
     const sellerNonce = (onboarding.seller_nonce || "").trim()
@@ -989,8 +1008,7 @@ class PayPalModuleService extends MedusaService({
     if (!newUrl || !legacyUrl || this.isLocalWebhookUrl(newUrl)) return
 
     const accessToken = await this.getAppAccessToken()
-    const baseUrl =
-      env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
 
     const getResp = await paypalFetch(
       `${baseUrl}/v1/notifications/webhooks/${encodeURIComponent(webhookId)}`,
@@ -1055,7 +1073,7 @@ class PayPalModuleService extends MedusaService({
     }
 
     const accessToken = await this.getAppAccessToken()
-    const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
     const webhookUrl = await this.resolveWebhookUrl()
 
     if (this.isLocalWebhookUrl(webhookUrl)) {
@@ -1296,7 +1314,7 @@ class PayPalModuleService extends MedusaService({
   private async refreshAccessToken(row: { id: string }): Promise<string> {
     const env = await this.getCurrentEnvironment()
     const creds = await this.getActiveCredentials()
-    const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
     const basic = Buffer.from(`${creds.client_id}:${creds.client_secret}`).toString("base64")
 
     const body = new URLSearchParams()
@@ -1334,7 +1352,7 @@ class PayPalModuleService extends MedusaService({
 
   async generateClientToken(opts?: { locale?: string }): Promise<string> {
     const env = await this.getCurrentEnvironment()
-    const baseUrl = env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com"
+    const baseUrl = getPayPalApiBase(env)
 
     const accessToken = await this.getAppAccessToken()
 
@@ -1363,7 +1381,14 @@ class PayPalModuleService extends MedusaService({
   }
 
   async getSettings() {
-    const rows = await this.listPayPalSettings({}, { take: 1 })
+    // Deterministic singleton read: always the OLDEST row. If a first-boot race
+    // ever created a duplicate settings row, every reader (here and the
+    // credential resolver's raw read) must agree on the same winner — ordering
+    // by created_at ASC guarantees that; an unordered `take: 1` does not.
+    const rows = await this.listPayPalSettings(
+      {},
+      { take: 1, order: { created_at: "ASC" } }
+    )
     const row = rows?.[0]
     return { data: (row?.data || {}) as Record<string, any> }
   }
@@ -1393,7 +1418,12 @@ class PayPalModuleService extends MedusaService({
   }
 
   async saveSettings(patch: Record<string, any>) {
-    const rows = await this.listPayPalSettings({}, { take: 1 })
+    // Same deterministic ordering as getSettings so reads and writes always
+    // target the same singleton row.
+    const rows = await this.listPayPalSettings(
+      {},
+      { take: 1, order: { created_at: "ASC" } }
+    )
     const row = rows?.[0]
     const current = (row?.data || {}) as Record<string, any>
 
@@ -1401,6 +1431,22 @@ class PayPalModuleService extends MedusaService({
 
     if (!row) {
       const created = await this.createPayPalSettings({ data: next })
+      // First-boot race guard: if a concurrent save created a row a moment
+      // earlier, the ASC ordering means that row is the canonical singleton —
+      // merge this patch into it instead of leaving a divergent duplicate.
+      const recheck = await this.listPayPalSettings(
+        {},
+        { take: 1, order: { created_at: "ASC" } }
+      )
+      const canonical = recheck?.[0]
+      if (canonical && canonical.id !== created.id) {
+        const merged = this.deepMerge(
+          (canonical.data || {}) as Record<string, any>,
+          patch
+        )
+        await this.updatePayPalSettings({ id: canonical.id, data: merged })
+        return { data: merged }
+      }
       return { data: (created.data || {}) as Record<string, any> }
     }
 
@@ -1438,10 +1484,7 @@ class PayPalModuleService extends MedusaService({
     }
 
     const env = await this.getCurrentEnvironment()
-    const base =
-      env === "live"
-        ? "https://api-m.paypal.com"
-        : "https://api-m.sandbox.paypal.com"
+    const base = getPayPalApiBase(env)
 
     const accessToken = await this.getAppAccessToken()
 
@@ -1554,6 +1597,15 @@ class PayPalModuleService extends MedusaService({
   }
 
   async recordMetric(name: string, metadata?: Record<string, unknown>) {
+    // Preferred path: single atomic INSERT ... ON CONFLICT (same statement the
+    // credential resolver uses), so concurrent routes/webhooks never lose
+    // increments to a read-modify-write race.
+    if (this.pgForMetrics) {
+      await recordMetricAtomic(this.pgForMetrics, name, metadata)
+      return null
+    }
+    // Fallback (container without a raw pg connection): the previous ORM
+    // read-modify-write. Best-effort only — never throws.
     try {
       const existing = await this.listPayPalMetrics({ name })
       const row = existing?.[0]

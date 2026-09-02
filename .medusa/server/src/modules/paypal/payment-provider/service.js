@@ -12,31 +12,6 @@ class PayPalPaymentProvider extends base_provider_1.PayPalProviderBase {
     static identifier = "paypal";
     sessionPrefix = "pp";
     idempotencyPrefix = "pp";
-    serializeError(error) {
-        if (error instanceof Error) {
-            const errorWithCause = error;
-            const cause = errorWithCause.cause;
-            return {
-                name: error.name,
-                message: error.message,
-                stack: error.stack,
-                cause: cause instanceof Error
-                    ? { name: cause.name, message: cause.message, stack: cause.stack }
-                    : cause,
-            };
-        }
-        return { message: String(error) };
-    }
-    async recordFailure(eventType, metadata) {
-        await this.paypal.recordAuditEvent(eventType, metadata);
-        await this.paypal.recordMetric(eventType, metadata);
-    }
-    async recordSuccess(metricName) {
-        await this.paypal.recordMetric(metricName);
-    }
-    async recordPaymentEvent(eventType, metadata) {
-        await this.paypal.recordAuditEvent(eventType, metadata);
-    }
     async initiatePayment(input) {
         const providerId = input.data?.provider_id;
         try {
@@ -650,6 +625,14 @@ class PayPalPaymentProvider extends base_provider_1.PayPalProviderBase {
                     throw new Error(`PayPal refund error (${resp.status}): ${text}${debugId ? ` debug_id=${debugId}` : ""}`);
                 }
                 const refund = await resp.json().catch(() => ({}));
+                // As with refundPayment: a 2xx response does not guarantee the refund
+                // stuck — FAILED / CANCELLED / DENIED refunds also return 2xx. Booking
+                // `canceled_at` for a refund that never went through would record a
+                // cancellation while the merchant keeps the funds.
+                const cancelRefundStatus = String(refund?.status || "").toUpperCase();
+                if ((0, status_utils_1.isRefundFailureStatus)(cancelRefundStatus)) {
+                    throw new Error(`PayPal cancel-refund did not succeed (status=${cancelRefundStatus}). The payment was not canceled.`);
+                }
                 const existingRefunds = Array.isArray(paypalData.refunds) ? paypalData.refunds : [];
                 const refundEntry = {
                     id: refund?.id,

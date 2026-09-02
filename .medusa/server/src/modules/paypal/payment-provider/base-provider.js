@@ -40,6 +40,32 @@ class PayPalProviderBase extends utils_1.AbstractPaymentProvider {
         throw new Error("Could not resolve pgConnection from the payment module container. " +
             "Ensure the paypal module is registered in medusa-config and the database is accessible.");
     }
+    /** Serialize an error for audit metadata without losing cause chains. */
+    serializeError(error) {
+        if (error instanceof Error) {
+            const errorWithCause = error;
+            const cause = errorWithCause.cause;
+            return {
+                name: error.name,
+                message: error.message,
+                stack: error.stack,
+                cause: cause instanceof Error
+                    ? { name: cause.name, message: cause.message, stack: cause.stack }
+                    : cause,
+            };
+        }
+        return { message: String(error) };
+    }
+    async recordFailure(eventType, metadata) {
+        await this.paypal.recordAuditEvent(eventType, metadata);
+        await this.paypal.recordMetric(eventType, metadata);
+    }
+    async recordSuccess(metricName) {
+        await this.paypal.recordMetric(metricName);
+    }
+    async recordPaymentEvent(eventType, metadata) {
+        await this.paypal.recordAuditEvent(eventType, metadata);
+    }
     generateSessionId() {
         try {
             return (0, crypto_1.randomUUID)();

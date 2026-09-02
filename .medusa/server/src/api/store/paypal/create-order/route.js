@@ -6,9 +6,9 @@ const crypto_1 = require("crypto");
 const amounts_1 = require("../../../../modules/paypal/utils/amounts");
 const currencies_1 = require("../../../../modules/paypal/utils/currencies");
 const paypal_auth_1 = require("../../../../modules/paypal/utils/paypal-auth");
+const partner_1 = require("../../../../modules/paypal/utils/partner");
 const paypal_fetch_1 = require("../../../../modules/paypal/utils/paypal-fetch");
 const payment_session_1 = require("../../../../modules/paypal/utils/payment-session");
-const BN_CODE = "MBJTechnolabs_SI_SPB";
 function resolveIdempotencyKey(req, suffix, fallback) {
     const header = req.headers["idempotency-key"] ||
         req.headers["Idempotency-Key"] ||
@@ -326,17 +326,22 @@ async function POST(req, res) {
         // instead of minting a fresh OAuth token on every create-order call.
         const base = (0, paypal_auth_1.getPayPalApiBase)(creds.environment);
         const accessToken = await paypal.getAppAccessToken();
-        // Deterministic-per-cart idempotency key for the PayPal call. Kept distinct
-        // from `requestId` (the log/response correlation id declared at the top of
-        // POST) so the two never shadow each other.
-        const paypalRequestId = resolveIdempotencyKey(req, `create-order-${cart.id}`, `pp-create-${cart.id}`);
+        // Deterministic-per-(cart, amount, currency) idempotency key for the PayPal
+        // call. The amount/currency MUST be part of the key: PayPal replays the
+        // cached response for a reused PayPal-Request-Id, so a key derived from the
+        // cart id alone would return the ORIGINAL order (at the original total)
+        // when the buyer changes the cart and a fresh order is minted — silently
+        // re-charging the stale amount and defeating the staleness check above.
+        // Kept distinct from `requestId` (the log/response correlation id declared
+        // at the top of POST) so the two never shadow each other.
+        const paypalRequestId = resolveIdempotencyKey(req, `create-order-${cart.id}-${value}-${currency}`, `pp-create-${cart.id}-${value}-${currency}`);
         const ppResp = await (0, paypal_fetch_1.paypalFetch)(`${base}/v2/checkout/orders`, {
             method: "POST",
             headers: {
                 Authorization: `Bearer ${accessToken}`,
                 "Content-Type": "application/json",
                 "PayPal-Request-Id": paypalRequestId,
-                "PayPal-Partner-Attribution-Id": BN_CODE,
+                "PayPal-Partner-Attribution-Id": partner_1.PAYPAL_PARTNER_ATTRIBUTION_ID,
             },
             body: JSON.stringify({
                 intent: paymentAction,

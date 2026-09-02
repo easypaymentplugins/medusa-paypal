@@ -134,22 +134,20 @@ async function adminFetch(path, opts = {}) {
   }
 }
 const DEFAULT_FORM$1 = {
-  enabled: true,
-  title: "Credit or Debit Card",
-  threeDS: "when_required"
+  paymentAction: "capture",
+  brandName: "PayPal",
+  landingPage: "no_preference",
+  requireInstantPayment: false,
+  sendItemDetails: true,
+  invoicePrefix: "PP-",
+  creditCardStatementName: "PayPal"
 };
 function mergeWithDefaults$1(saved) {
   if (!saved) return { ...DEFAULT_FORM$1 };
   const entries = Object.entries(saved).filter(([, value]) => value !== void 0);
   return { ...DEFAULT_FORM$1, ...Object.fromEntries(entries) };
 }
-const THREE_DS_OPTIONS = [
-  { value: "when_required", label: "3D Secure when required", hint: "Triggers 3DS only when the card / issuer requires it." },
-  { value: "sli", label: "3D Secure (SCA) / liability shift (recommended)", hint: "Attempts to optimize for liability shift while remaining compliant." },
-  { value: "always", label: "Always request 3D Secure", hint: "Forces 3DS challenge whenever possible (may reduce conversion)." }
-];
-function AdvancedCardPaymentsTab() {
-  var _a, _b;
+function AdditionalSettingsTab() {
   const [form, setForm] = react.useState(() => ({ ...DEFAULT_FORM$1 }));
   const [loading, setLoading] = react.useState(false);
   const [saving, setSaving] = react.useState(false);
@@ -164,90 +162,8 @@ function AdvancedCardPaymentsTab() {
         setLoading(true);
         const json = await adminFetch("/admin/paypal/settings");
         const payload = (json == null ? void 0 : json.data) ?? json;
-        const saved = payload == null ? void 0 : payload.advanced_card_payments;
-        if (saved && typeof saved === "object") setForm(mergeWithDefaults$1(saved));
-      } catch {
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, []);
-  async function onSave() {
-    try {
-      setSaving(true);
-      const json = await adminFetch("/admin/paypal/settings", {
-        method: "POST",
-        body: { advanced_card_payments: form }
-      });
-      const payload = (json == null ? void 0 : json.data) ?? json;
-      const saved = payload == null ? void 0 : payload.advanced_card_payments;
-      if (saved && typeof saved === "object") setForm(mergeWithDefaults$1(saved));
-      setToast({ kind: "success", message: "Settings saved" });
-    } catch (e) {
-      setToast({ kind: "error", message: (e instanceof Error ? e.message : "") || "Failed to save settings." });
-    } finally {
-      setSaving(false);
-    }
-  }
-  return /* @__PURE__ */ jsxRuntime.jsx("div", { className: "p-6", children: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "flex flex-col gap-6", children: [
-    /* @__PURE__ */ jsxRuntime.jsx("div", { className: "flex items-start justify-between gap-4", children: /* @__PURE__ */ jsxRuntime.jsx("div", { children: /* @__PURE__ */ jsxRuntime.jsx("h1", { className: "text-xl font-semibold text-ui-fg-base", children: "PayPal Gateway By Easy Payment" }) }) }),
-    /* @__PURE__ */ jsxRuntime.jsx(PayPalTabs, {}),
-    /* @__PURE__ */ jsxRuntime.jsx(Toast, { toast, onClose: dismissToast }),
-    /* @__PURE__ */ jsxRuntime.jsx(
-      SectionCard,
-      {
-        title: "Advanced Card Payments",
-        description: "Control card checkout settings and 3D Secure behavior.",
-        right: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "flex items-center gap-3", children: [
-          /* @__PURE__ */ jsxRuntime.jsx("button", { type: "button", onClick: onSave, disabled: saving || loading, className: "transition-fg relative inline-flex w-fit items-center justify-center overflow-hidden rounded-md outline-none shadow-buttons-neutral text-ui-fg-base bg-ui-button-neutral after:transition-fg after:absolute after:inset-0 after:content-[''] after:button-neutral-gradient hover:bg-ui-button-neutral-hover hover:after:button-neutral-hover-gradient active:bg-ui-button-neutral-pressed active:after:button-neutral-pressed-gradient focus-visible:shadow-buttons-neutral-focus disabled:bg-ui-bg-disabled disabled:border-ui-border-base disabled:text-ui-fg-disabled disabled:shadow-buttons-neutral disabled:after:hidden txt-compact-small-plus px-3 py-1.5", children: saving ? "Saving..." : "Save settings" }),
-          loading ? /* @__PURE__ */ jsxRuntime.jsx("span", { className: "text-sm text-ui-fg-subtle", children: "Loading…" }) : null
-        ] }),
-        children: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "divide-y divide-ui-border-base", children: [
-          /* @__PURE__ */ jsxRuntime.jsx(FieldRow, { label: "Enable/Disable", children: /* @__PURE__ */ jsxRuntime.jsxs("label", { className: "inline-flex items-center gap-2", children: [
-            /* @__PURE__ */ jsxRuntime.jsx("input", { type: "checkbox", checked: form.enabled, onChange: (e) => setForm((p) => ({ ...p, enabled: e.target.checked })), className: "h-4 w-4 rounded border-ui-border-base" }),
-            /* @__PURE__ */ jsxRuntime.jsx("span", { className: "text-sm text-ui-fg-base", children: "Enable Advanced Credit/Debit Card" })
-          ] }) }),
-          /* @__PURE__ */ jsxRuntime.jsx(FieldRow, { label: "Title", htmlFor: "acp-title", children: /* @__PURE__ */ jsxRuntime.jsx("input", { id: "acp-title", value: form.title, onChange: (e) => setForm((p) => ({ ...p, title: e.target.value })), className: "w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive", placeholder: "Credit or Debit Card" }) }),
-          /* @__PURE__ */ jsxRuntime.jsx(FieldRow, { label: "Contingency for 3D Secure", hint: "Choose when 3D Secure should be triggered during card payments.", htmlFor: "acp-threeds", children: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "flex flex-col gap-2", children: [
-            /* @__PURE__ */ jsxRuntime.jsx("select", { id: "acp-threeds", value: form.threeDS, onChange: (e) => setForm((p) => ({ ...p, threeDS: e.target.value })), className: "w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive", children: THREE_DS_OPTIONS.map((o) => /* @__PURE__ */ jsxRuntime.jsx("option", { value: o.value, children: o.label }, o.value)) }),
-            ((_a = THREE_DS_OPTIONS.find((o) => o.value === form.threeDS)) == null ? void 0 : _a.hint) ? /* @__PURE__ */ jsxRuntime.jsx("div", { className: "text-xs text-ui-fg-subtle", children: (_b = THREE_DS_OPTIONS.find((o) => o.value === form.threeDS)) == null ? void 0 : _b.hint }) : null
-          ] }) })
-        ] })
-      }
-    )
-  ] }) });
-}
-const DEFAULT_FORM = {
-  paymentAction: "capture",
-  brandName: "PayPal",
-  landingPage: "no_preference",
-  requireInstantPayment: false,
-  sendItemDetails: true,
-  invoicePrefix: "PP-",
-  creditCardStatementName: "PayPal"
-};
-function mergeWithDefaults(saved) {
-  if (!saved) return { ...DEFAULT_FORM };
-  const entries = Object.entries(saved).filter(([, value]) => value !== void 0);
-  return { ...DEFAULT_FORM, ...Object.fromEntries(entries) };
-}
-function AdditionalSettingsTab() {
-  const [form, setForm] = react.useState(() => ({ ...DEFAULT_FORM }));
-  const [loading, setLoading] = react.useState(false);
-  const [saving, setSaving] = react.useState(false);
-  const [toast, setToast] = react.useState(null);
-  const didInit = react.useRef(false);
-  const dismissToast = react.useCallback(() => setToast(null), []);
-  react.useEffect(() => {
-    if (didInit.current) return;
-    didInit.current = true;
-    (async () => {
-      try {
-        setLoading(true);
-        const json = await adminFetch("/admin/paypal/settings");
-        const payload = (json == null ? void 0 : json.data) ?? json;
         const saved = payload == null ? void 0 : payload.additional_settings;
-        if (saved && typeof saved === "object") setForm(mergeWithDefaults(saved));
+        if (saved && typeof saved === "object") setForm(mergeWithDefaults$1(saved));
       } catch {
       } finally {
         setLoading(false);
@@ -261,7 +177,7 @@ function AdditionalSettingsTab() {
       const json = await adminFetch("/admin/paypal/settings", { method: "POST", body: { additional_settings: form } });
       const payload = (json == null ? void 0 : json.data) ?? json;
       const saved = payload == null ? void 0 : payload.additional_settings;
-      if (saved && typeof saved === "object") setForm(mergeWithDefaults(saved));
+      if (saved && typeof saved === "object") setForm(mergeWithDefaults$1(saved));
       setToast({ kind: "success", message: "Settings saved" });
     } catch (e) {
       setToast({ kind: "error", message: e instanceof Error ? e.message : "Failed to save settings" });
@@ -308,10 +224,91 @@ function AdditionalSettingsTab() {
     )
   ] }) });
 }
-function PayPalApplePayPage() {
-  return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
+const DEFAULT_FORM = {
+  enabled: true,
+  title: "Credit or Debit Card",
+  threeDS: "when_required"
+};
+function mergeWithDefaults(saved) {
+  if (!saved) return { ...DEFAULT_FORM };
+  const entries = Object.entries(saved).filter(([, value]) => value !== void 0);
+  return { ...DEFAULT_FORM, ...Object.fromEntries(entries) };
 }
-function PayPalGooglePayPage() {
+const THREE_DS_OPTIONS = [
+  { value: "when_required", label: "3D Secure when required", hint: "Triggers 3DS only when the card / issuer requires it." },
+  { value: "sli", label: "3D Secure (SCA) / liability shift (recommended)", hint: "Attempts to optimize for liability shift while remaining compliant." },
+  { value: "always", label: "Always request 3D Secure", hint: "Forces 3DS challenge whenever possible (may reduce conversion)." }
+];
+function AdvancedCardPaymentsTab() {
+  var _a, _b;
+  const [form, setForm] = react.useState(() => ({ ...DEFAULT_FORM }));
+  const [loading, setLoading] = react.useState(false);
+  const [saving, setSaving] = react.useState(false);
+  const [toast, setToast] = react.useState(null);
+  const didInit = react.useRef(false);
+  const dismissToast = react.useCallback(() => setToast(null), []);
+  react.useEffect(() => {
+    if (didInit.current) return;
+    didInit.current = true;
+    (async () => {
+      try {
+        setLoading(true);
+        const json = await adminFetch("/admin/paypal/settings");
+        const payload = (json == null ? void 0 : json.data) ?? json;
+        const saved = payload == null ? void 0 : payload.advanced_card_payments;
+        if (saved && typeof saved === "object") setForm(mergeWithDefaults(saved));
+      } catch {
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+  async function onSave() {
+    try {
+      setSaving(true);
+      const json = await adminFetch("/admin/paypal/settings", {
+        method: "POST",
+        body: { advanced_card_payments: form }
+      });
+      const payload = (json == null ? void 0 : json.data) ?? json;
+      const saved = payload == null ? void 0 : payload.advanced_card_payments;
+      if (saved && typeof saved === "object") setForm(mergeWithDefaults(saved));
+      setToast({ kind: "success", message: "Settings saved" });
+    } catch (e) {
+      setToast({ kind: "error", message: (e instanceof Error ? e.message : "") || "Failed to save settings." });
+    } finally {
+      setSaving(false);
+    }
+  }
+  return /* @__PURE__ */ jsxRuntime.jsx("div", { className: "p-6", children: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "flex flex-col gap-6", children: [
+    /* @__PURE__ */ jsxRuntime.jsx("div", { className: "flex items-start justify-between gap-4", children: /* @__PURE__ */ jsxRuntime.jsx("div", { children: /* @__PURE__ */ jsxRuntime.jsx("h1", { className: "text-xl font-semibold text-ui-fg-base", children: "PayPal Gateway By Easy Payment" }) }) }),
+    /* @__PURE__ */ jsxRuntime.jsx(PayPalTabs, {}),
+    /* @__PURE__ */ jsxRuntime.jsx(Toast, { toast, onClose: dismissToast }),
+    /* @__PURE__ */ jsxRuntime.jsx(
+      SectionCard,
+      {
+        title: "Advanced Card Payments",
+        description: "Control card checkout settings and 3D Secure behavior.",
+        right: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "flex items-center gap-3", children: [
+          /* @__PURE__ */ jsxRuntime.jsx("button", { type: "button", onClick: onSave, disabled: saving || loading, className: "transition-fg relative inline-flex w-fit items-center justify-center overflow-hidden rounded-md outline-none shadow-buttons-neutral text-ui-fg-base bg-ui-button-neutral after:transition-fg after:absolute after:inset-0 after:content-[''] after:button-neutral-gradient hover:bg-ui-button-neutral-hover hover:after:button-neutral-hover-gradient active:bg-ui-button-neutral-pressed active:after:button-neutral-pressed-gradient focus-visible:shadow-buttons-neutral-focus disabled:bg-ui-bg-disabled disabled:border-ui-border-base disabled:text-ui-fg-disabled disabled:shadow-buttons-neutral disabled:after:hidden txt-compact-small-plus px-3 py-1.5", children: saving ? "Saving..." : "Save settings" }),
+          loading ? /* @__PURE__ */ jsxRuntime.jsx("span", { className: "text-sm text-ui-fg-subtle", children: "Loading…" }) : null
+        ] }),
+        children: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "divide-y divide-ui-border-base", children: [
+          /* @__PURE__ */ jsxRuntime.jsx(FieldRow, { label: "Enable/Disable", children: /* @__PURE__ */ jsxRuntime.jsxs("label", { className: "inline-flex items-center gap-2", children: [
+            /* @__PURE__ */ jsxRuntime.jsx("input", { type: "checkbox", checked: form.enabled, onChange: (e) => setForm((p) => ({ ...p, enabled: e.target.checked })), className: "h-4 w-4 rounded border-ui-border-base" }),
+            /* @__PURE__ */ jsxRuntime.jsx("span", { className: "text-sm text-ui-fg-base", children: "Enable Advanced Credit/Debit Card" })
+          ] }) }),
+          /* @__PURE__ */ jsxRuntime.jsx(FieldRow, { label: "Title", htmlFor: "acp-title", children: /* @__PURE__ */ jsxRuntime.jsx("input", { id: "acp-title", value: form.title, onChange: (e) => setForm((p) => ({ ...p, title: e.target.value })), className: "w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive", placeholder: "Credit or Debit Card" }) }),
+          /* @__PURE__ */ jsxRuntime.jsx(FieldRow, { label: "Contingency for 3D Secure", hint: "Choose when 3D Secure should be triggered during card payments.", htmlFor: "acp-threeds", children: /* @__PURE__ */ jsxRuntime.jsxs("div", { className: "flex flex-col gap-2", children: [
+            /* @__PURE__ */ jsxRuntime.jsx("select", { id: "acp-threeds", value: form.threeDS, onChange: (e) => setForm((p) => ({ ...p, threeDS: e.target.value })), className: "w-full rounded-md border border-ui-border-base bg-ui-bg-base px-3 py-2 text-sm text-ui-fg-base outline-none focus:ring-2 focus:ring-ui-border-interactive", children: THREE_DS_OPTIONS.map((o) => /* @__PURE__ */ jsxRuntime.jsx("option", { value: o.value, children: o.label }, o.value)) }),
+            ((_a = THREE_DS_OPTIONS.find((o) => o.value === form.threeDS)) == null ? void 0 : _a.hint) ? /* @__PURE__ */ jsxRuntime.jsx("div", { className: "text-xs text-ui-fg-subtle", children: (_b = THREE_DS_OPTIONS.find((o) => o.value === form.threeDS)) == null ? void 0 : _b.hint }) : null
+          ] }) })
+        ] })
+      }
+    )
+  ] }) });
+}
+function PayPalApplePayPage() {
   return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
 }
 const config = adminSdk.defineRouteConfig({
@@ -1031,6 +1028,9 @@ function PayPalConnectionPage() {
       ` })
   ] });
 }
+function PayPalGooglePayPage() {
+  return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
+}
 function PayPalPayLaterMessagingPage() {
   return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
 }
@@ -1249,24 +1249,24 @@ const routeModule = {
       path: "/settings/paypal"
     },
     {
-      Component: AdvancedCardPaymentsTab,
-      path: "/settings/paypal/advanced-card-payments"
-    },
-    {
       Component: AdditionalSettingsTab,
       path: "/settings/paypal/additional-settings"
+    },
+    {
+      Component: AdvancedCardPaymentsTab,
+      path: "/settings/paypal/advanced-card-payments"
     },
     {
       Component: PayPalApplePayPage,
       path: "/settings/paypal/apple-pay"
     },
     {
-      Component: PayPalGooglePayPage,
-      path: "/settings/paypal/google-pay"
-    },
-    {
       Component: PayPalConnectionPage,
       path: "/settings/paypal/connection"
+    },
+    {
+      Component: PayPalGooglePayPage,
+      path: "/settings/paypal/google-pay"
     },
     {
       Component: PayPalPayLaterMessagingPage,

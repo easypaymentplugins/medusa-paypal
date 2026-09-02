@@ -31,8 +31,8 @@ function readEnvInt(name, fallback) {
     return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 /** The configured max, or null when rate limiting is disabled (opt-in). */
-function readConfiguredMax() {
-    const raw = process.env.PAYPAL_RATE_LIMIT_MAX;
+function readConfiguredMax(envVar) {
+    const raw = process.env[envVar];
     if (raw === undefined || raw === "")
         return null;
     const v = Number(raw);
@@ -55,16 +55,18 @@ function clientKey(req) {
         "unknown";
     return ip;
 }
-function createRateLimiter(scope) {
+function createRateLimiter(scope, options = {}) {
     const buckets = new Map();
+    const maxEnvVar = options.maxEnvVar || "PAYPAL_RATE_LIMIT_MAX";
+    const windowEnvVar = options.windowEnvVar || "PAYPAL_RATE_LIMIT_WINDOW_MS";
     return function rateLimit(req, res, next) {
         // Opt-in: with no configured max, this middleware is a pass-through so
         // existing deployments (especially behind a shared-IP proxy) are unaffected.
-        const max = readConfiguredMax();
+        const max = readConfiguredMax(maxEnvVar);
         if (max === null) {
             return next();
         }
-        const windowMs = readEnvInt("PAYPAL_RATE_LIMIT_WINDOW_MS", DEFAULT_WINDOW_MS);
+        const windowMs = readEnvInt(windowEnvVar, DEFAULT_WINDOW_MS);
         const now = Date.now();
         const key = `${scope}:${clientKey(req)}`;
         let bucket = buckets.get(key);

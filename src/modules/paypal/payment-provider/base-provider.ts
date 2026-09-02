@@ -59,6 +59,37 @@ export abstract class PayPalProviderBase extends AbstractPaymentProvider<Options
     )
   }
 
+  /** Serialize an error for audit metadata without losing cause chains. */
+  protected serializeError(error: unknown) {
+    if (error instanceof Error) {
+      const errorWithCause = error as Error & { cause?: unknown }
+      const cause = errorWithCause.cause
+      return {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+        cause:
+          cause instanceof Error
+            ? { name: cause.name, message: cause.message, stack: cause.stack }
+            : cause,
+      }
+    }
+    return { message: String(error) }
+  }
+
+  protected async recordFailure(eventType: string, metadata?: Record<string, unknown>) {
+    await this.paypal.recordAuditEvent(eventType, metadata)
+    await this.paypal.recordMetric(eventType, metadata)
+  }
+
+  protected async recordSuccess(metricName: string) {
+    await this.paypal.recordMetric(metricName)
+  }
+
+  protected async recordPaymentEvent(eventType: string, metadata?: Record<string, unknown>) {
+    await this.paypal.recordAuditEvent(eventType, metadata)
+  }
+
   protected generateSessionId(): string {
     try {
       return randomUUID()

@@ -66,11 +66,15 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
       currencyCode,
       paypalCurrencyOverride: currencyOverride,
     })
+    // Preserve the provider_id passthrough exactly like the wallet provider —
+    // dropping it here would make the two providers' session data diverge.
+    const providerId = (input.data as Record<string, any> | undefined)?.provider_id
 
     return {
       data: {
         ...(input.data || {}),
         ...this.invalidateStaleOrder(input, currencyCode),
+        ...(providerId ? { provider_id: providerId } : {}),
         amount: input.amount,
         currency_code: currencyCode,
       },
@@ -114,6 +118,11 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
       // The previous fallback created a fresh order here and immediately
       // called /authorize on it, which PayPal always rejects (no payment
       // source, and 422 UNSUPPORTED_INTENT for CAPTURE-intent orders).
+      await this.recordFailure("authorize_failed", {
+        cart_id: data.cart_id,
+        payment_collection_id: data.payment_collection_id,
+        message: "no PayPal order on card session",
+      })
       throw new MedusaError(
         MedusaError.Types.NOT_ALLOWED,
         "No PayPal order was found for this payment session. The buyer must submit and approve their card payment before the cart can be completed."
@@ -304,6 +313,11 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
 
     // CREATED / SAVED / PAYER_ACTION_REQUIRED etc.: the buyer never approved
     // the payment — nothing is authorized at PayPal.
+    await this.recordFailure("authorize_failed", {
+      order_id: orderId,
+      order_status: orderStatus,
+      message: "PayPal order not approved by buyer",
+    })
     throw new MedusaError(
       MedusaError.Types.NOT_ALLOWED,
       `PayPal order ${orderId} has not been approved by the buyer (status ${orderStatus || "UNKNOWN"}). The payment cannot be authorized.`
@@ -345,6 +359,7 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
     const requestId = this.getIdempotencyKey(_input, `capture-${orderId}-${amount}`)
     let debugId: string | null = null
 
+    try {
     const { accessToken, base } = await this.getPayPalAccessToken()
     const order = await this.getOrderDetails(orderId).catch(() => null)
     const existingCapture = order?.purchase_units?.[0]?.payments?.captures?.[0]
@@ -475,6 +490,16 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
       raw: capture,
     }
 
+    await this.recordSuccess("capture_success")
+    await this.recordPaymentEvent("capture", {
+      order_id: orderId,
+      capture_id: captureId,
+      authorization_id: authorizationId || undefined,
+      amount,
+      currency_code: currencyCode,
+      request_id: requestId,
+    })
+
     return {
       data: {
         ...(data || {}),
@@ -489,6 +514,22 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
         captured_at: new Date().toISOString(),
       },
     }
+    } catch (error: any) {
+      await this.recordFailure("capture_failed", {
+        order_id: orderId,
+        request_id: requestId,
+        debug_id: debugId,
+        message: error?.message,
+      })
+      // Surface the real reason: Medusa masks non-MedusaErrors as a generic
+      // "unknown error" in production, hiding the PayPal failure.
+      throw error instanceof MedusaError
+        ? error
+        : new MedusaError(
+            MedusaError.Types.INVALID_DATA,
+            error?.message || "PayPal capture failed."
+          )
+    }
   }
 
   async cancelPayment(_input: CancelPaymentInput): Promise<CancelPaymentOutput> {
@@ -500,6 +541,7 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
       paypalData.authorization_id || data.authorization_id || ""
     )
 
+    try {
     const order = orderId ? await this.getOrderDetails(orderId) : null
     const intent = String(order?.intent || "").toUpperCase()
     const authorizationId =
@@ -532,6 +574,12 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
           }`
         )
       }
+
+      await this.recordSuccess("void_success")
+      await this.recordPaymentEvent("void", {
+        order_id: orderId,
+        authorization_id: authorizationId,
+      })
     } else if (captureId) {
       const { accessToken, base } = await this.getPayPalAccessToken()
       const requestId = this.getIdempotencyKey(_input, `cancel-refund-${captureId}`)
@@ -561,6 +609,18 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
       }
 
       const refund = await resp.json().catch(() => ({}))
+
+      // As with refundPayment: a 2xx response does not guarantee the refund
+      // stuck — FAILED / CANCELLED / DENIED refunds also return 2xx. Booking
+      // `canceled_at` for a refund that never went through would record a
+      // cancellation while the merchant keeps the funds.
+      const cancelRefundStatus = String(refund?.status || "").toUpperCase()
+      if (isRefundFailureStatus(cancelRefundStatus)) {
+        throw new Error(
+          `PayPal cancel-refund did not succeed (status=${cancelRefundStatus}). The payment was not canceled.`
+        )
+      }
+
       const existingRefunds = Array.isArray(paypalData.refunds) ? paypalData.refunds : []
       const refundEntry = {
         id: refund?.id,
@@ -568,6 +628,8 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
         amount: refund?.amount,
         raw: refund,
       }
+
+      await this.recordSuccess("cancel_refund_success")
 
       return {
         data: {
@@ -597,6 +659,14 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
         },
         canceled_at: new Date().toISOString(),
       },
+    }
+    } catch (error: any) {
+      await this.recordFailure("cancel_failed", {
+        order_id: orderId,
+        capture_id: captureId,
+        message: error?.message,
+      })
+      throw error
     }
   }
 
@@ -684,6 +754,15 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
         raw: refund,
       }
 
+      await this.recordSuccess("refund_success")
+      await this.recordPaymentEvent("refund", {
+        capture_id: captureId,
+        refund_id: refund?.id,
+        amount,
+        currency_code: currencyCode,
+        request_id: requestId,
+      })
+
       return {
         data: {
           ...(data || {}),
@@ -698,6 +777,11 @@ class PayPalAdvancedCardProvider extends PayPalProviderBase {
         },
       }
     } catch (error: any) {
+      await this.recordFailure("refund_failed", {
+        capture_id: captureId,
+        request_id: requestId,
+        message: error?.message,
+      })
       // Surface the real reason: Medusa masks any non-MedusaError as a generic
       // "An unknown error occurred." in production, hiding the PayPal failure.
       throw error instanceof MedusaError

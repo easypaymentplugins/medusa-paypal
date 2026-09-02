@@ -183,8 +183,12 @@ async function attemptRetry(
       capture_id: processed.captureId,
       cart_id: processed.cartId,
       session_updated: processed.sessionUpdated,
+      cart_completed: processed.cartCompleted,
     })
 
+    if (processed.cartCompleted) {
+      await paypal.recordMetric("webhook_cart_completed").catch(() => {})
+    }
     await paypal.recordMetric("webhook_retry_success").catch(() => {})
   } catch (error: any) {
     const retryable = isRetryableError(error)

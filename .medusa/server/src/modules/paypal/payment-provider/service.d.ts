@@ -4,10 +4,6 @@ declare class PayPalPaymentProvider extends PayPalProviderBase {
     static identifier: string;
     protected readonly sessionPrefix = "pp";
     protected readonly idempotencyPrefix = "pp";
-    private serializeError;
-    private recordFailure;
-    private recordSuccess;
-    private recordPaymentEvent;
     initiatePayment(input: InitiatePaymentInput): Promise<InitiatePaymentOutput>;
     updatePayment(input: UpdatePaymentInput): Promise<UpdatePaymentOutput>;
     authorizePayment(input: AuthorizePaymentInput): Promise<AuthorizePaymentOutput>;
