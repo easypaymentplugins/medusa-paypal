@@ -3,6 +3,7 @@
 **Accept PayPal and credit card payments in your Medusa v2 store — built by an official PayPal Partner.**
 
 [![npm version](https://img.shields.io/npm/v/@easypayment/medusa-payment-paypal?color=blue&label=npm)](https://www.npmjs.com/package/@easypayment/medusa-payment-paypal)
+[![npm downloads](https://img.shields.io/npm/dm/@easypayment/medusa-payment-paypal?color=blue&label=downloads)](https://www.npmjs.com/package/@easypayment/medusa-payment-paypal)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Medusa v2](https://img.shields.io/badge/Medusa-v2-9b59b6)](https://medusajs.com)
 [![PayPal PPCP](https://img.shields.io/badge/PayPal-PPCP-003087)](https://developer.paypal.com)
@@ -24,8 +25,8 @@
 
 ## ✅ Requirements
 
-- Medusa **v2**
-- Node.js **18+**
+- Medusa **v2.12+**
+- Node.js **20+**
 - PostgreSQL
 
 ---
@@ -167,6 +168,14 @@ Everything is managed in **Medusa Admin → Settings → PayPal** — changes ap
 **Monitoring:** operational counters live in the `paypal_metric` table; every webhook is recorded in `paypal_webhook_event` with automatic retries; audit events are logged as JSON lines tagged `"log":"paypal_audit"` (secrets redacted).
 
 </details>
+
+---
+
+## 💬 Support
+
+- 🐛 **Found a bug?** [Open an issue](https://github.com/easypaymentplugins/medusa-paypal/issues)
+- 💡 **Questions or feature requests?** [Start a discussion](https://github.com/easypaymentplugins/medusa-paypal/discussions)
+- 🛍 **Storefront UI package:** [@easypayment/medusa-paypal-ui](https://www.npmjs.com/package/@easypayment/medusa-paypal-ui)
 
 ---
 

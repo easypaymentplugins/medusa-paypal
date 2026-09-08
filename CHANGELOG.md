@@ -2,6 +2,14 @@
 
 All notable changes to `@easypayment/medusa-payment-paypal` are documented here.
 
+## 1.2.3 — 2026-09-08
+
+### Changed
+- **Docs & metadata only — no code changes.** Expanded npm keywords and
+  sharpened the package description for discoverability; added `homepage` and
+  `bugs` links to the npm page; README now shows the correct requirements
+  (Node 20+, Medusa v2.12+), a monthly-downloads badge, and a Support section.
+
 ## 1.2.0 — 2026-09-02
 
 ### Fixed

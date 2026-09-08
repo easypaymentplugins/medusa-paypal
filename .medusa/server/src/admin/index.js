@@ -311,6 +311,9 @@ function AdvancedCardPaymentsTab() {
 function PayPalApplePayPage() {
   return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
 }
+function PayPalGooglePayPage() {
+  return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
+}
 const config = adminSdk.defineRouteConfig({
   label: "PayPal Connection"
 });
@@ -1028,9 +1031,6 @@ function PayPalConnectionPage() {
       ` })
   ] });
 }
-function PayPalGooglePayPage() {
-  return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
-}
 function PayPalPayLaterMessagingPage() {
   return /* @__PURE__ */ jsxRuntime.jsx(reactRouterDom.Navigate, { to: "/settings/paypal/connection", replace: true });
 }
@@ -1261,12 +1261,12 @@ const routeModule = {
       path: "/settings/paypal/apple-pay"
     },
     {
-      Component: PayPalConnectionPage,
-      path: "/settings/paypal/connection"
-    },
-    {
       Component: PayPalGooglePayPage,
       path: "/settings/paypal/google-pay"
+    },
+    {
+      Component: PayPalConnectionPage,
+      path: "/settings/paypal/connection"
     },
     {
       Component: PayPalPayLaterMessagingPage,

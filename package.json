@@ -1,7 +1,7 @@
 {
   "name": "@easypayment/medusa-payment-paypal",
-  "version": "1.2.0",
-  "description": "PayPal for Medusa v2 \u2014 Built by a PayPal Partner.",
+  "version": "1.2.3",
+  "description": "PayPal & credit card payments for Medusa v2 \u2014 PayPal Buttons, hosted card fields, 3D Secure, and an admin dashboard. Built by a PayPal Partner.",
   "author": "EasyPayment Plugins",
   "license": "MIT",
   "main": "./.medusa/server/src/index.js",
@@ -83,9 +83,25 @@
     "type": "git",
     "url": "https://github.com/easypaymentplugins/medusa-paypal.git"
   },
+  "homepage": "https://github.com/easypaymentplugins/medusa-paypal#readme",
+  "bugs": {
+    "url": "https://github.com/easypaymentplugins/medusa-paypal/issues"
+  },
   "keywords": [
     "medusa-v2",
     "medusa-plugin-integration",
-    "medusa-plugin-payment"
+    "medusa-plugin-payment",
+    "medusa",
+    "medusajs",
+    "medusa-plugin",
+    "paypal",
+    "paypal-checkout",
+    "payment",
+    "payments",
+    "payment-provider",
+    "checkout",
+    "ecommerce",
+    "credit-card",
+    "3d-secure"
   ]
 }
